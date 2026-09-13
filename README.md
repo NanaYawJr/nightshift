@@ -87,11 +87,16 @@ nightshift/
 │   ├── ARCHITECTURE.md
 │   ├── EVALUATION.md
 │   └── DECISIONS.md          # architecture decision records
+├── common/                   # shared across every layer
+│   ├── config.py             # settings from .env, single source
+│   ├── auth.py               # service principal token, cached
+│   └── fabric_api.py         # REST client: pagination, throttling
 ├── estate/                   # the synthetic Fabric estate
 │   ├── workspaces/           # item definitions, deployed via fabric-cli
 │   ├── seed/                 # data generators
 │   └── faults/               # fault injector — one module per fault class
 ├── collectors/
+│   ├── _smoke.py             # auth checkpoint: list visible workspaces
 │   ├── rest_jobs.py          # job instances, item definitions
 │   ├── capacity_metrics.py   # XMLA against the Capacity Metrics model
 │   ├── activity_events.py    # admin activity + scanner APIs
@@ -112,7 +117,10 @@ nightshift/
 │   ├── rubric.md             # scoring definitions
 │   └── results/
 ├── report/                   # Power BI semantic model + report (TMDL, PBIP)
-└── notebooks/                # Fabric notebook entry points
+├── notebooks/                # Fabric notebook entry points
+├── tests/                    # unit tests, no network required
+├── pytest.ini
+└── requirements.txt
 ```
 
 ## Getting started
