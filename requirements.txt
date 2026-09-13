@@ -1,0 +1,19 @@
+# Auth and HTTP
+msal>=1.31
+requests>=2.32
+
+# Config and contracts
+pydantic>=2.9
+pydantic-settings>=2.6
+
+# Data
+pandas>=2.2
+pyarrow>=17.0
+
+# SQL safety for the variance engine
+sqlglot>=25.0
+
+# Dev
+pytest>=8.3
+responses>=0.25
+ruff>=0.7
