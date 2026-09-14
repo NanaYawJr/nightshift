@@ -159,3 +159,104 @@ equivalent is built.
 something in a workspace its own author had forgotten existed. That is a better
 demonstration than any injected fault. Discovered incidents remain excluded from
 benchmark scoring per D-004, since there is no sealed ground truth for them.
+
+---
+
+## D-008 — The diagnostic principal holds Member, not Viewer
+
+**Date:** 2026-09-13
+**Status:** Accepted, with reservations
+
+**Context.** The architecture states the diagnostic service principal is
+read-only, and it was granted Viewer on `PowerBiProjects` accordingly. Reading
+semantic model inventory worked; reading refresh history returned 403.
+
+```
+GET /v1.0/myorg/groups/{groupId}/datasets/{datasetId}/refreshes
+403 Client Error: Forbidden
+```
+
+Raising the principal to Member resolved it immediately. This is a quirk of the
+Power BI permission model rather than anything wrong with the request: refresh
+history is treated as a dataset-management operation rather than a read, so it
+requires a write-capable workspace role.
+
+Member is not read-only. It can publish, modify and delete items in the
+workspace.
+
+**Decision.** The diagnostic principal is granted Member where refresh history
+is required. The read-only intent is preserved in code rather than in
+permissions: `common/powerbi_api.py` and `common/fabric_api.py` expose only
+`get`-shaped functions, and no module in `collectors/` issues anything but GET.
+
+**Consequences.** Isolation is weaker than the architecture claims, and the
+architecture document must be corrected rather than left aspirational. The
+mitigation is real but is a code-level guarantee, not a platform-level one — a
+mistake in `collectors/` could now do damage that Viewer would have prevented.
+
+Two alternatives were considered and rejected for now. Dropping refresh history
+from the REST collectors and taking it from `semantic-link-labs` in a notebook
+would keep the principal at Viewer, but moves collection into the Fabric runtime
+and away from the local, testable, capacity-free development loop. Using a
+second principal scoped only to refresh history adds a credential to manage for
+one endpoint.
+
+**Revisit if.** Fabric item-level permissions come to cover the refresh history
+endpoint, or collection moves into the notebook runtime for other reasons. This
+is the single weakest point in the current security posture and should not be
+carried into a client deployment unexamined.
+
+---
+
+## D-009 — MFI has never successfully refreshed
+
+**Date:** 2026-09-13
+**Status:** Accepted, corrects D-004
+
+**Context.** With refresh history readable, `MFI` returned exactly three runs,
+all on 24 April 2026 within a five-minute window, all `OnDemand`, all `Failed`,
+all with the same error:
+
+```
+{"errorCode":"ModelRefreshDisabled_CredentialNotSpecified"}
+```
+
+No runs before, none since. The data source credentials were never configured
+after the model was published, three manual attempts failed in under a second
+each, and nobody returned to it.
+
+This corrects an assumption carried since calibration. The 24 April date was
+read as "last refreshed"; it is in fact the last *attempted* refresh. `MFI` has
+never successfully refreshed in the service. Its contents are whatever was in
+the PBIX at upload time, five months ago.
+
+**Decision.** `MFI` is reclassified within the discovered population. It is not
+a stale model that has drifted out of date — it is a model that never worked and
+was never noticed, which is a distinct and more interesting fault.
+
+The `stale_model` detection rule is split accordingly:
+
+- **Overdue** — last successful refresh older than the model's own schedule
+  interval by some margin.
+- **Never succeeded** — no run with status `Completed` in the available history.
+- **Failing repeatedly** — the most recent runs share an identical error code,
+  indicating a configuration fault rather than a transient one.
+
+The third is the most valuable. A repeated identical error code is a strong
+signal that nobody is watching, because a human who saw it would either fix it
+or turn the schedule off.
+
+**Consequences.** This is the project's thesis demonstrated in the author's own
+tenant, found by the author's own collector, before any synthetic fault existed.
+It goes in the write-up. It also means `MFI` cannot be used as a baseline for
+refresh duration anomaly detection, since it has no successful run to baseline
+against — that baseline must come from the synthetic estate.
+
+**Also noted.** The API returns a `refreshAttempts` array, empty for these runs
+but populated where a refresh was retried internally. Not currently captured by
+`collectors/refresh_history.py`. Worth adding before the detection rules are
+written, since retry counts distinguish a transient failure from a hard one.
+
+**Revisit if.** Credentials are configured and `MFI` begins refreshing, at which
+point it becomes an ordinary model and loses its value as a discovered fault.
+Recommendation: leave it broken until the project is captured.
