@@ -105,3 +105,57 @@ The three findings:
 **Consequences.** The remediation path cannot write TMDL back to a semantic model directly. This is consistent with the architecture regardless — remediation is delivered as a pull request against the workspace repository, not as a direct model edit. So the restriction costs nothing in practice, which is worth noting: it was discovered as a limitation and turned out to align with an existing design decision.
 
 **Revisit if.** The project moves to a paid capacity, or a remediation type emerges that genuinely requires direct model write.
+
+---
+
+## D-007 — Duration rules exclude interactive runs
+
+**Date:** 2026-09-13
+**Status:** Accepted
+
+**Context.** The first live collection returned one job run: the calibration
+notebook, `job_type: RunNotebookInteractive`, `invoke_type: Manual`, with a
+duration of 2,406 seconds. The notebook's cells executed in roughly 50 seconds.
+The remaining 40 minutes is Spark session lifetime — the session stays alive
+until it idles out, and the job record measures the session, not the work.
+
+A naive duration anomaly rule would treat every interactive notebook run as a
+40-minute job and fire constantly on human activity.
+
+**Decision.** Duration-based detection rules filter to `invoke_type ==
+"Scheduled"`. Manual and interactive runs are collected and stored but excluded
+from anomaly detection. Where a notebook's execution time is genuinely needed,
+it must come from cell-level telemetry rather than the job record.
+
+**Consequences.** Someone manually running a pathological notebook and burning
+capacity will not be flagged by duration rules. Capacity-based rules still catch
+it, which is the correct division — duration is a reliability signal, consumption
+is a cost signal, and they should not be conflated.
+
+**Revisit if.** Cell-level notebook telemetry becomes available, or manual runs
+turn out to be a meaningful share of capacity consumption in the estate.
+
+---
+
+## D-004a — Addendum: the discovered population is larger than MFI
+
+**Date:** 2026-09-13
+**Status:** Accepted, extends D-004
+
+**Context.** The first inventory collection returned six items in
+`PowerBiProjects`, not the four assumed during calibration. Alongside `MFI`
+there is a `Road Accident` semantic model, report and dashboard, none of which
+featured in any planning and none of which had been opened in months. The
+dashboard is named `Road Accident.pbix`, the default title Power BI assigns when
+a dashboard is auto-created on publish from Desktop — it was almost certainly
+not made deliberately.
+
+**Decision.** The `Road Accident` items join `MFI` as `origin: discovered`. The
+`abandoned_item` fault class now has real candidates rather than only injected
+ones, and its detection rule will be written against these before any synthetic
+equivalent is built.
+
+**Consequences.** Strengthens the claim the project is built on: the agent found
+something in a workspace its own author had forgotten existed. That is a better
+demonstration than any injected fault. Discovered incidents remain excluded from
+benchmark scoring per D-004, since there is no sealed ground truth for them.
