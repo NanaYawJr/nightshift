@@ -260,3 +260,141 @@ written, since retry counts distinguish a transient failure from a hard one.
 **Revisit if.** Credentials are configured and `MFI` begins refreshing, at which
 point it becomes an ordinary model and loses its value as a discovered fault.
 Recommendation: leave it broken until the project is captured.
+
+---
+
+## D-010 — Spark session lifetime dominates capacity cost
+
+**Date:** 2026-09-16
+**Status:** Accepted
+
+**Context.** First reading from the Capacity Metrics app after seeding the
+estate. Four items have consumed capacity since the trial began:
+
+| Workspace | Item kind | Item | CU (s) | Duration (s) |
+|---|---|---|---|---|
+| hl-finance-prod | SynapseNotebook | 01_seed_estate | 22,486 | 2,557 |
+| PowerBiProjects | SynapseNotebook | 00_calibration_mfi | 20,254 | 2,402 |
+| hl-finance-prod | Lakehouse | lh_finance_bronze | 321 | 0.16 |
+| PowerBiProjects | Dataset | MFI | 28 | 1.93 |
+
+`01_seed_estate` generated 2.7 million rows across five tables and wrote them
+as Delta. `00_calibration_mfi` ran two `semantic-link-labs` calls against a
+930 KB model — roughly 50 seconds of actual work.
+
+They cost within 10% of each other.
+
+This is D-007 quantified. The job record bills Spark session lifetime, not
+execution time. A notebook that does almost nothing but stays attached costs
+roughly what a notebook doing serious work costs. Two nearly-idle sessions
+account for over 99% of capacity consumed to date.
+
+**Decision.** Collectors that require the Spark runtime batch all their work
+into a single session per run. `collectors/model_stats` will iterate every
+semantic model inside one notebook invocation rather than being invoked per
+model. Session-bound collection runs daily, not hourly — the marginal cost of
+more frequent collection is session startup, not the work itself.
+
+Collectors that do not need Spark stay in local Python against the REST APIs,
+where they cost nothing at all. This is now a cost argument as well as a
+testability one.
+
+**Consequences.** Model statistics are up to 24 hours stale. Acceptable:
+VertiPaq column sizes and BPA findings change when a model is edited or its
+schema drifts, which is not an hourly event. Refresh history, which *is* time
+sensitive, comes from the REST API and stays hourly.
+
+Design constraint for the agent layer: the diagnostician's `model_stats` and
+`run_bpa` tools cannot each open their own session. They read from the daily
+collection, or they share one session, or the agent becomes the most expensive
+item in the estate.
+
+**Revisit if.** Fabric introduces a lighter runtime for semantic-link-labs
+style work, or session startup cost falls materially.
+
+---
+
+## D-011 — Capacity is not the binding constraint
+
+**Date:** 2026-09-16
+**Status:** Accepted, relaxes an assumption in ARCHITECTURE.md
+
+**Context.** After seeding the full estate, average capacity utilisation over
+24 hours is 0.05%, peak 0.41%, with zero throttling and zero rejected
+operations on an FTL64.
+
+The architecture document budgets Nightshift at under 8 CU-h/day and imposes a
+no-sub-hourly-schedules rule, both written before any measurement existed. The
+total consumption of the project to date is roughly 12 CU-h across six days.
+
+**Decision.** The no-sub-hourly rule is relaxed from a hard constraint to a
+default. Where a detection rule genuinely benefits from tighter granularity it
+may run more frequently, subject to D-010 — the constraint that actually binds
+is Spark session count, not capacity units.
+
+The fault injector may rewrite tables freely rather than being rationed.
+
+**Consequences.** Removes a self-imposed limitation that was costing design
+flexibility for no measured benefit. The CU budget table in ARCHITECTURE.md is
+now known to be conservative by roughly an order of magnitude and should be
+restated against real figures rather than left as an estimate.
+
+Caution retained: the trial cannot be paused or reset, so the *absence* of a
+binding constraint today is not licence to stop watching. A runaway agent loop
+in week 6 could still consume meaningfully, and iteration caps stay.
+
+**Revisit if.** The fault injector or the agent loop moves utilisation above
+roughly 20% sustained.
+
+---
+
+## D-012 — PostedTimestamp is retained as an unplanned bloat candidate
+
+**Date:** 2026-09-16
+**Status:** Accepted
+
+**Context.** Cardinality check against the seeded Ledger at full scale:
+
+```
+TransactionID      2,000,000   100.00% of rows
+PostedTimestamp    1,872,666    93.63%
+SourceRef            864,973    43.25%
+Amount               343,485    17.17%
+ClientID              45,000     2.25%
+TransactionDate          562     0.03%
+PostedBy                  30
+Branch                    12
+ProductCode                8
+Channel                    5
+Status                     4
+CurrencyCode               3
+```
+
+Five and a half orders of magnitude between widest and narrowest, which is the
+distribution D-003 called for.
+
+`PostedTimestamp` at 93.63% was not designed. Second-granularity timestamps are
+near-unique by construction, and in VertiPaq will be among the most expensive
+columns in any model built on this table.
+
+**Decision.** It stays. It is a genuine and common real-world bloat cause that
+does not *look* like one — a timestamp reads as innocuous where a free-text
+narrative field reads as suspicious. It becomes a second `model_bloat`
+candidate alongside the injected `TransactionNarrative`, and arguably the more
+interesting of the two, since diagnosing it requires the agent to reason about
+cardinality rather than pattern-match on "text column".
+
+**Consequences.** The `model_bloat` fault class now has a discovered instance
+as well as injected ones. Like `MFI` under D-004, discovered instances are
+excluded from benchmark scoring for want of sealed ground truth.
+
+**Also confirmed.** The Delta transaction log carries `numOutputRows` in
+`operationMetrics` — 2,000,000 on the Ledger's initial commit. This was an
+assumption until now. The `silent_zero_row` fault class is viable: a pipeline
+that reports success while writing nothing produces a commit with
+`numOutputRows: 0`, readable via `DESCRIBE HISTORY` without any additional
+telemetry source.
+
+**Also noted.** The initial write produced `numFiles: 200`. Small-file
+fragmentation is a real performance pattern and a plausible future finding, but
+is not currently a fault class.
