@@ -1,7 +1,8 @@
 """Fault framework tests.
 
 Spark is faked. These test the contract — ground truth, reversibility,
-determinism — not whether the SQL executes, which only Fabric can confirm.
+determinism — and which operations a fault asks for, not whether they execute.
+Only Fabric can confirm execution.
 """
 
 import json
@@ -13,15 +14,61 @@ from estate.faults.base import Fault, Seal
 from estate.faults.library import IMPLEMENTED, PENDING, ModelBloat, SchemaDrift
 
 
+class FakeWriter:
+    """Records the write chain: mode, options, format, target table."""
+
+    def __init__(self, log: list):
+        self.log = log
+
+    def mode(self, value):
+        self.log.append(("mode", value))
+        return self
+
+    def option(self, key, value):
+        self.log.append(("option", key, value))
+        return self
+
+    def format(self, value):
+        self.log.append(("format", value))
+        return self
+
+    def saveAsTable(self, name):
+        self.log.append(("saveAsTable", name))
+
+
+class FakeFrame:
+    """Records transformations applied to a table read."""
+
+    def __init__(self, log: list):
+        self.log = log
+
+    def withColumnRenamed(self, old, new):
+        self.log.append(("rename", old, new))
+        return self
+
+    def drop(self, column):
+        self.log.append(("drop", column))
+        return self
+
+    @property
+    def write(self):
+        return FakeWriter(self.log)
+
+
 class FakeSpark:
     """Records what was asked of it. Executes nothing."""
 
     def __init__(self):
         self.statements: list[str] = []
+        self.log: list[tuple] = []
 
     def sql(self, statement: str):
         self.statements.append(" ".join(statement.split()))
         return None
+
+    def table(self, name: str):
+        self.log.append(("table", name))
+        return FakeFrame(self.log)
 
 
 class TrivialFault(Fault):
@@ -104,15 +151,41 @@ def test_parameters_change_the_id():
 # --- Schema drift ----------------------------------------------------------
 
 
-def test_schema_drift_renames_then_restores():
+def test_schema_drift_renames_by_rewrite():
     fault = SchemaDrift("hl-finance-prod", "Ledger")
     spark = FakeSpark()
 
     fault.inject(spark)
-    assert "RENAME COLUMN PostedTimestamp TO posted_ts" in spark.statements[0]
 
+    assert ("rename", "PostedTimestamp", "posted_ts") in spark.log
+    assert ("option", "overwriteSchema", "true") in spark.log
+    assert ("saveAsTable", "Ledger") in spark.log
+
+
+def test_schema_drift_never_alters_the_table_in_place():
+    """Regression: ALTER TABLE RENAME COLUMN requires Delta column mapping,
+    a one-way protocol upgrade. The rewrite approach must never issue it."""
+    fault = SchemaDrift("hl-finance-prod", "Ledger")
+    spark = FakeSpark()
+
+    fault.inject(spark)
     fault.revert(spark)
-    assert "RENAME COLUMN posted_ts TO PostedTimestamp" in spark.statements[1]
+
+    assert not any("ALTER" in s for s in spark.statements)
+
+
+def test_schema_drift_revert_restores_the_original_name():
+    fault = SchemaDrift("hl-finance-prod", "Ledger")
+    spark = FakeSpark()
+
+    fault.inject(spark)
+    fault.revert(spark)
+
+    renames = [entry for entry in spark.log if entry[0] == "rename"]
+    assert renames == [
+        ("rename", "PostedTimestamp", "posted_ts"),
+        ("rename", "posted_ts", "PostedTimestamp"),
+    ]
 
 
 def test_schema_drift_ground_truth_names_both_columns():
@@ -127,8 +200,9 @@ def test_schema_drift_ground_truth_names_both_columns():
 
 def test_schema_drift_accepts_a_different_column():
     fault = SchemaDrift("ws", "Ledger", column="SourceRef", new_name="source_ref")
-    fault.inject(FakeSpark())
-    assert fault.parameters()["original_column"] == "SourceRef"
+    spark = FakeSpark()
+    fault.inject(spark)
+    assert ("rename", "SourceRef", "source_ref") in spark.log
 
 
 # --- Model bloat -----------------------------------------------------------
@@ -137,7 +211,7 @@ def test_schema_drift_accepts_a_different_column():
 def test_model_bloat_ground_truth_flags_no_consumer():
     """The diagnosis hinges on the column being unused. Say so explicitly.
 
-    `_apply` needs real Spark, so only the declaration is checked here.
+    `_apply` needs real PySpark functions, so only the declaration is checked.
     """
     fault = ModelBloat("hl-finance-prod", "Ledger")
 
