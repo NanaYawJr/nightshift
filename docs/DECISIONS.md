@@ -398,3 +398,252 @@ telemetry source.
 **Also noted.** The initial write produced `numFiles: 200`. Small-file
 fragmentation is a real performance pattern and a plausible future finding, but
 is not currently a fault class.
+
+---
+
+## D-013 — Faults rewrite tables; schema drift is detected by diffing versions
+
+**Date:** 2026-09-21
+**Status:** Accepted
+
+**Context.** The first run of a fault against real Delta, rather than against the
+test suite's fake Spark. `SchemaDrift` was originally written to rename a column
+in place:
+
+```sql
+ALTER TABLE Ledger RENAME COLUMN PostedTimestamp TO posted_ts
+```
+
+Checking the table first showed this would fail:
+
+```
+column mapping: none
+reader version: 1
+writer version: 2
+```
+
+In-place column renames require Delta column mapping. Enabling it is a one-way
+protocol upgrade — the table cannot be returned to its previous protocol — and
+some tools that read Delta tables do not handle column-mapped tables. The
+semantic models this project is about to build on top of `Ledger` are among the
+readers most likely to be affected.
+
+**Decision.** Faults change a table by rewriting it, never by altering it in place.
+`SchemaDrift` reads the table, renames the column in the frame, and overwrites the
+table with `overwriteSchema` enabled. `ModelBloat` already worked this way. A shared
+helper, `_overwrite`, now holds the pattern, and a test fails if any fault ever
+issues an `ALTER` statement.
+
+This is also more realistic. Real schema drift rarely arrives as a polite
+`ALTER TABLE`; it arrives as an upstream source sending a full load in a new shape.
+
+**Consequence for detection.** Verified on the real table. Inject and revert
+produced three versions with identical operation names:
+
+| Version | Operation | What actually happened |
+|---|---|---|
+| 0 | CREATE OR REPLACE TABLE AS SELECT | Initial seed |
+| 1 | CREATE OR REPLACE TABLE AS SELECT | Column renamed |
+| 2 | CREATE OR REPLACE TABLE AS SELECT | Column restored |
+
+The transaction log does not distinguish a schema change from a plain reload. A
+detection rule watching for a rename operation would see nothing.
+
+So the `schema_drift` rule compares the table's schema at consecutive versions,
+using Delta time travel to read each version's column list. This catches drift
+however it is produced — by this injector, by a pipeline reload, or by a tool
+that also avoids `ALTER TABLE`.
+
+**Also consequent.** Rewriting costs more capacity than a metadata change, since
+every row is rewritten. Acceptable under D-011: capacity is not the binding
+constraint. The smoke test rewrote 2 million rows twice in 13 seconds.
+
+**Revisit if.** A fault class genuinely cannot be expressed as a rewrite, or
+rewrite cost becomes material as the estate grows.
+
+---
+
+## D-014 — The Spark runtime is pinned
+
+**Date:** 2026-09-21
+**Status:** Accepted
+
+**Context.** A banner in the Fabric notebook announced that Runtime 2.0 — with a
+new major Spark version and a new Delta version — becomes the default runtime in
+late September 2026. Every notebook in the project currently runs on
+"Workspace default", which means the Spark and Delta versions underneath them
+would change without any action from the project.
+
+The project's central claim rests on a reproducible benchmark: the same seed
+must produce the same faults and the same measurements. An unannounced change of
+Spark and Delta versions partway through would put every comparison across that
+boundary in doubt — a change in results could come from the platform rather than
+from the agent.
+
+**Decision.** Create a Fabric Environment with an explicit runtime version and
+attach it to every project notebook in place of the workspace default. The
+platform changes only when the project decides it should.
+
+**Consequences.** Improvements in the new runtime are not picked up automatically.
+Runtime 2.0 may be tested deliberately later, in a separate Environment, and
+adopted only if the benchmark reproduces on it.
+
+The Environment is also the natural home for `semantic-link-labs`, which is
+currently installed with `%pip install` at the start of every session. Moving it
+into the Environment removes the per-session install and pins its version too —
+two sources of drift closed by one change.
+
+**Revisit if.** The pinned runtime approaches end of support before the project
+is captured.
+
+---
+
+## D-015 — Model bloat is measured by refresh duration and Delta size, not memory
+
+**Date:** 2026-09-28
+**Status:** Accepted, supersedes an assumption in ARCHITECTURE.md
+
+**Context.** `sm_revenue_core` was published as an Import model over the
+Lakehouse SQL analytics endpoint, refreshed successfully, and confirmed to hold
+2,000,000 rows via DAX. `vertipaq_analyzer` nevertheless reported a total model
+size of 0 B with every table at 0 rows.
+
+Reading the underlying DMV directly returned 280 segments with the expected
+columns, but every one of them empty:
+
+```
+ISPAGEABLE  ISRESIDENT  VERTIPAQ_STATE
+True        False       SKIPPED          240
+False       True        SKIPPED           40
+
+RECORDS_COUNT   0
+ALLOCATED_SIZE  0
+```
+
+`VERTIPAQ_STATE = SKIPPED` throughout means the engine is not computing segment
+statistics for this model, and 240 of 280 columns are pageable and not resident.
+Querying the model to warm it made no difference. In-memory size is therefore
+not a signal this project can rely on.
+
+**Decision.** `model_bloat` is detected and quantified through three signals,
+none of which depend on residency:
+
+1. **Refresh duration**, from `collectors/refresh_history`. A near-unique text
+   column on two million rows genuinely lengthens a refresh. This is INC-0412's
+   headline symptom and survives unchanged.
+2. **Delta table size and schema**, from `DESCRIBE DETAIL` and the transaction
+   log. This is the cause rather than the symptom, and it is exact.
+3. **Column cardinality**, computed from the table directly.
+
+**Consequences.** Arguably a better design than the original. Memory size is a
+single symptom measured at one point; this combination catches the cause
+upstream in the Lakehouse and the symptom downstream in the model, and depends
+on nothing the platform may decline to report.
+
+ARCHITECTURE.md describes a `model_stats` tool returning VertiPaq column sizes.
+That description is now wrong and must be corrected.
+
+**Revisit if.** A model is published in a configuration where VertiPaq
+statistics are computed, in which case memory size becomes an additional signal
+rather than a replacement.
+
+---
+
+## D-016 — Collectors read DMVs directly rather than through semantic-link-labs
+
+**Date:** 2026-09-28
+**Status:** Accepted
+
+**Context.** `vertipaq_analyzer` reported zeros where the underlying DMV,
+queried directly with `fabric.evaluate_dax` against
+`INFO.STORAGETABLECOLUMNSEGMENTS()`, returned 280 rows with the full column set:
+`USED_SIZE`, `ALLOCATED_SIZE`, `RECORDS_COUNT`, `ISPAGEABLE`, `ISRESIDENT`,
+`TEMPERATURE`, `LAST_ACCESSED`, `VERTIPAQ_STATE`.
+
+The library was not surfacing information that was plainly available.
+
+**Decision.** `collectors/model_stats` queries the DMVs directly. `sempy.fabric`
+provides the connection; `semantic-link-labs` is retained for Best Practice
+Analyzer, which has no straightforward DMV equivalent, but is not in the path
+for size or cardinality statistics.
+
+**Consequences.** Slightly more code in the collector, in exchange for removing
+a library version from between the project and its primary measurement. Given
+D-014 pinned that library specifically to prevent drift, removing the dependency
+where possible is consistent rather than contradictory.
+
+Also removes a failure mode that is hard to diagnose: a library returning zeros
+looks identical to a model that is genuinely empty. A raw DMV returning rows
+with zero values is at least legible.
+
+**Revisit if.** A later version of `semantic-link-labs` handles this correctly
+and offers something the raw DMV does not.
+
+---
+
+## D-017 — Revert is logical, not physical
+
+**Date:** 2026-09-28
+**Status:** Accepted
+
+**Context.** Baseline capture of `ledger` after one inject-and-revert cycle of
+`SchemaDrift`:
+
+```
+rows:     2,000,000
+columns:  12
+files:    8
+size:     65,844,777 bytes (62.8 MB)
+version:  2
+```
+
+The initial seed wrote **200 files**. After two rewrites the table holds the
+same rows in **8 files** — Spark coalesced on write. The schema and data are
+identical to the starting state; the physical layout is not.
+
+**Decision.** `revert()` guarantees logical state only: same rows, same schema,
+same values. It does not guarantee file count, file sizes or table version.
+This is documented in the fault contract rather than fixed, because forcing an
+identical physical layout would require rewriting with an explicit partition
+count and would make faults slower and more brittle for no diagnostic benefit.
+
+**Consequences for the benchmark.** File count and layout are not valid baseline
+measurements across a benchmark run, because earlier faults change them. Any
+detection rule keyed on `numFiles` would drift over a thirty-fault run and
+produce findings caused by the harness rather than by the fault. Small-file
+fragmentation is therefore explicitly excluded as a fault class, having already
+been noted under D-012 as a candidate.
+
+Valid baselines are row count, column set, and table size in bytes. All three
+are unaffected by coalescing.
+
+**Revisit if.** A fault class genuinely requires physical-layout fidelity, or if
+file count becomes a detection signal worth having.
+
+---
+
+## D-018 — Workspace naming inconsistency, deferred
+
+**Date:** 2026-09-28
+**Status:** Known issue, deliberately deferred
+
+**Context.** Four workspaces were created with the digit `1` rather than a
+lowercase `l`: `h1-finance-prod`, `h1-ops-analytics`, `h1-sandbox`,
+`h1-nightshift`. A fifth, `hl-care-quality`, uses the intended `l`. The two are
+visually near-identical in most fonts.
+
+This surfaced as a `WorkspaceNotFoundException` when code written from the
+planning documents used `hl-finance-prod`.
+
+**Decision.** Left as-is for now, at the cost of every reference in code and
+documentation having to match the actual names rather than the intended ones.
+Renaming is safe — item IDs are unaffected — but was deferred to avoid
+interrupting the semantic model build.
+
+**Consequences.** A real trap. A rule, a test fixture or a harness parameter
+written from memory will fail in a way that is hard to see on screen. Until this
+is resolved, workspace names belong in configuration rather than scattered
+through code, so there is one place to correct when it is.
+
+**Revisit:** before the evaluation harness is written. A benchmark run that
+fails on a mistyped workspace name would be a poor use of week seven.
