@@ -647,3 +647,207 @@ through code, so there is one place to correct when it is.
 
 **Revisit:** before the evaluation harness is written. A benchmark run that
 fails on a mistyped workspace name would be a poor use of week seven.
+
+---
+
+## D-019 — Import models pin their column list; model_bloat is widening, not addition
+
+**Date:** 2026-09-30
+**Status:** Accepted, supersedes the mechanism in the design mockup
+
+**Context.** INC-0412 as designed said: an upstream change adds a
+high-cardinality column, a semantic model importing the whole table picks it up
+without anyone deciding to include it, and refresh time multiplies. The Power
+Query source deliberately used no column selection so the import would behave
+as a wildcard.
+
+It does not. `TransactionNarrative` was added to the Lakehouse `ledger` table,
+the SQL analytics endpoint was confirmed to expose it, and `sm_revenue_core` was
+refreshed repeatedly. The model stayed at 35 columns throughout.
+
+The TMDL explains why. Every column is stored explicitly:
+
+```tmdl
+column SourceRef
+    dataType: string
+    sourceColumn: SourceRef
+```
+
+The wildcard expands at publish time. Refresh re-reads the named columns and
+nothing else. A new upstream column is never requested.
+
+**Decision.** `ModelBloat` is replaced by `ColumnWidening`. Rather than adding a
+column, the fault makes an existing one near-unique: `SourceRef` values gain the
+row's `TransactionID` appended, taking the column from 864,973 distinct values
+to 2,000,000. The schema does not change — same twelve columns, same names, same
+types.
+
+The fault class remains `model_bloat`, so the evaluation taxonomy is unaffected.
+Only the mechanism changed.
+
+**Verified end to end:**
+
+| | Before | After |
+|---|---|---|
+| Columns | 12 | 12 |
+| SourceRef distinct | 864,973 | 2,000,000 |
+| Delta table size | 62.8 MB | 70.9 MB |
+| Model size (VertiPaq) | 97.5 MB | 106.9 MB |
+
+The model grew more than the table did — 9.4 MB against 8.1 — because
+VertiPaq's dictionary was compressing harder than Parquet's, so losing it cost
+more.
+
+**Consequences.** A better fault than the original in three ways. It is
+realistic: source systems change what they put in a field far more often than
+they add fields. It is invisible to schema comparison, so the agent must reason
+about cardinality against history rather than spot a new name. And it is exactly
+invertible — `substring_index(SourceRef, '#', 1)` restores the original values —
+where dropping an added column is only approximately a revert.
+
+The injector refuses to run if the separator already occurs in the data, since
+revert would otherwise truncate real values.
+
+**Revisit if.** A model is ever published in a way that genuinely re-discovers
+source columns at refresh, in which case column addition becomes viable again as
+a second mechanism.
+
+---
+
+## D-020 — Direct Lake is the platform default and must be guarded against
+
+**Date:** 2026-09-30
+**Status:** Accepted
+
+**Context.** Two full days were lost to measurements that made no sense: refreshes
+completing in three seconds, `VERTIPAQ_STATE: SKIPPED` on every segment, a model
+reporting 0 B while holding two million rows, and a new column that never
+arrived however many times the model was refreshed.
+
+The cause was that `sm_revenue_core` was a **Direct Lake** model, not an Import
+one. Direct Lake pages columns from OneLake on demand rather than loading them,
+so there is no import to lengthen, no resident footprint to measure, and
+"refresh" is a metadata operation that takes seconds.
+
+It was created accidentally, twice. Every obvious route in Fabric produces Direct
+Lake: the Lakehouse's "New semantic model" button, the OneLake catalog connector
+in Power BI Desktop, and opening an existing Direct Lake model in Desktop for
+live editing. Only the SQL analytics endpoint via the plain SQL Server connector,
+with Import explicitly chosen, produces an Import model.
+
+**Decision.** Before any measurement is taken against a semantic model, its mode
+is verified:
+
+```python
+fabric.evaluate_dax(
+    dataset=..., workspace=...,
+    dax_string='EVALUATE SELECTCOLUMNS(INFO.PARTITIONS(), "table", [Name], "mode", [Mode])'
+)
+```
+
+Mode 5 is Direct Lake. Mode 0 or 1 on a model with `VERTIPAQ_STATE: COMPLETED`
+segments is Import. `collectors/model_stats` records the mode alongside every
+measurement, and detection rules that depend on refresh duration or model size
+apply only to Import models.
+
+**Consequences.** Direct Lake models cannot be diagnosed by the signals this
+project currently uses. That is a limitation to state plainly rather than hide,
+and it matters commercially: if Fabric's defaults push every new model to Direct
+Lake, then Direct Lake is what real estates will contain.
+
+Direct Lake has its own failure mode worth a future fault class — exceeding a
+guardrail causes silent fallback to DirectQuery, which is slow, invisible, and
+reports success. That is the same shape as every other fault here and would fit
+the project well. Out of scope for the trial; recorded for later.
+
+**Also noted.** The stranded Direct Lake model was renamed
+`sm_revenue_core_direct_lake` rather than deleted, to avoid another wrong-item
+mistake while both existed. It should be deleted once the Import model is stable.
+
+---
+
+## D-021 — Published models can be unrefreshable, and this is a fault class
+
+**Date:** 2026-09-30
+**Status:** Accepted
+
+**Context.** The Import model published successfully and then refused every
+refresh:
+
+```
+Premium_ASWL_Error: We cannot refresh this semantic model because this
+semantic model uses a default data connection without explicit connection
+credentials.
+```
+
+Publishing bound the SQL endpoint to "Default: Single Sign-On" rather than to an
+explicit cloud connection. Fixing it required creating a named connection with
+OAuth 2.0 credentials in Manage Connections and Gateways, then rebinding the
+model to it and applying.
+
+This is D-009 recurring. `MFI` has never successfully refreshed since April for
+a closely related reason — `ModelRefreshDisabled_CredentialNotSpecified` — and
+nobody noticed for five months.
+
+Two models, both published by a competent person, both landing in a state where
+they can never refresh, and neither surfacing that fact anywhere a person would
+look.
+
+**Decision.** `unrefreshable_model` is added to the fault taxonomy as a detection
+target, though not yet as an injectable fault. Detection is straightforward from
+data already collected: a model whose most recent refresh attempts all failed
+with the same credential-related error code, or a model with a refresh schedule
+and no successful run in its history.
+
+**Consequences.** The evaluation taxonomy grows from six classes to seven, with
+the seventh scored only against discovered instances until an injector exists.
+`MFI` and the pre-fix state of `sm_revenue_core` are both real examples, found
+in the author's own tenant rather than manufactured.
+
+This strengthens the project's central claim rather than complicating it. A model
+that reports success in the workspace list while being structurally incapable of
+refreshing is exactly the silent failure the agent exists to find.
+
+---
+
+## D-022 — Faults must be revertible from sealed ground truth, not from a live object
+
+**Date:** 2026-09-30
+**Status:** Accepted, requires a change to `estate/faults/base.py`
+
+**Context.** Three separate times, a Fabric notebook session timed out between
+injecting a fault and reverting it. Each time `fault.revert(spark)` raised
+`NameError: name 'fault' is not defined`, and the estate had to be restored by
+hand-writing the inverse transform.
+
+The fault framework holds revert state in `self._revert_state`, an attribute of a
+live Python object. A notebook session lasts perhaps twenty minutes of idleness;
+a thirty-fault benchmark run will last longer than that.
+
+**Decision.** `Fault` gains a `from_ground_truth(truth)` classmethod that
+reconstructs an injected instance from its sealed JSON alone. Every fault's
+`parameters()` must therefore carry everything `_undo` needs — which they
+already do, since the seal was designed to be a complete record of what was
+done.
+
+Any fault can then be reverted by any process at any time, given only the sealed
+file:
+
+```python
+fault = Seal().load(fault_id)
+ColumnWidening.from_ground_truth(fault).revert(spark)
+```
+
+**Consequences.** Removes a dependency on session lifetime from the benchmark,
+which would otherwise have failed partway through a run and left the estate in an
+unknown state — the worst possible outcome for a reproducible measurement.
+
+It also makes cleanup possible after a crash. Currently a lost session means
+manual restoration, and manual restoration is how an estate quietly drifts away
+from its baseline without anyone recording it.
+
+**Also implied.** Sealing must happen immediately on injection, before anything
+else. A fault injected but not yet sealed is a fault that cannot be reverted.
+
+**Revisit if.** Faults ever need state that cannot be serialised — which would be
+a reason to question the fault, not the rule.
