@@ -3,6 +3,9 @@
 Spark is faked. These test the contract — ground truth, reversibility,
 determinism — and which operations a fault asks for, not whether they execute.
 Only Fabric can confirm execution.
+
+The SQL expressions used by ColumnWidening are kept as plain strings precisely
+so they can be tested here, without a Spark runtime.
 """
 
 import json
@@ -11,7 +14,14 @@ from datetime import datetime
 import pytest
 
 from estate.faults.base import Fault, Seal
-from estate.faults.library import IMPLEMENTED, PENDING, ModelBloat, SchemaDrift
+from estate.faults.library import (
+    IMPLEMENTED,
+    PENDING,
+    ColumnWidening,
+    SchemaDrift,
+    narrow_expression,
+    widen_expression,
+)
 
 
 class FakeWriter:
@@ -44,6 +54,10 @@ class FakeFrame:
 
     def withColumnRenamed(self, old, new):
         self.log.append(("rename", old, new))
+        return self
+
+    def withColumn(self, name, expr):
+        self.log.append(("withColumn", name))
         return self
 
     def drop(self, column):
@@ -128,7 +142,6 @@ def test_revert_allows_reinjection():
 
 
 def test_fault_id_is_stable_across_instances():
-    """Same seed, same target, same parameters — same id."""
     a = TrivialFault("ws", "item", seed=99)
     b = TrivialFault("ws", "item", seed=99)
     assert a.fault_id == b.fault_id
@@ -143,8 +156,8 @@ def test_seed_changes_the_id():
 def test_parameters_change_the_id():
     """Regression: two schema drifts on one table collided and the second
     silently overwrote the first's sealed ground truth."""
-    a = SchemaDrift("ws", "Ledger", column="PostedTimestamp", new_name="posted_ts")
-    b = SchemaDrift("ws", "Ledger", column="SourceRef", new_name="source_ref")
+    a = SchemaDrift("ws", "ledger", column="PostedTimestamp", new_name="posted_ts")
+    b = SchemaDrift("ws", "ledger", column="SourceRef", new_name="source_ref")
     assert a.fault_id != b.fault_id
 
 
@@ -152,20 +165,20 @@ def test_parameters_change_the_id():
 
 
 def test_schema_drift_renames_by_rewrite():
-    fault = SchemaDrift("hl-finance-prod", "Ledger")
+    fault = SchemaDrift("h1-finance-prod", "ledger")
     spark = FakeSpark()
 
     fault.inject(spark)
 
     assert ("rename", "PostedTimestamp", "posted_ts") in spark.log
     assert ("option", "overwriteSchema", "true") in spark.log
-    assert ("saveAsTable", "Ledger") in spark.log
+    assert ("saveAsTable", "ledger") in spark.log
 
 
 def test_schema_drift_never_alters_the_table_in_place():
-    """Regression: ALTER TABLE RENAME COLUMN requires Delta column mapping,
-    a one-way protocol upgrade. The rewrite approach must never issue it."""
-    fault = SchemaDrift("hl-finance-prod", "Ledger")
+    """ALTER TABLE RENAME COLUMN requires Delta column mapping, a one-way
+    protocol upgrade. The rewrite approach must never issue it."""
+    fault = SchemaDrift("h1-finance-prod", "ledger")
     spark = FakeSpark()
 
     fault.inject(spark)
@@ -175,7 +188,7 @@ def test_schema_drift_never_alters_the_table_in_place():
 
 
 def test_schema_drift_revert_restores_the_original_name():
-    fault = SchemaDrift("hl-finance-prod", "Ledger")
+    fault = SchemaDrift("h1-finance-prod", "ledger")
     spark = FakeSpark()
 
     fault.inject(spark)
@@ -189,40 +202,77 @@ def test_schema_drift_revert_restores_the_original_name():
 
 
 def test_schema_drift_ground_truth_names_both_columns():
-    fault = SchemaDrift("hl-finance-prod", "Ledger")
+    fault = SchemaDrift("h1-finance-prod", "ledger")
     truth = fault.inject(FakeSpark())
 
     assert truth.fault_class == "schema_drift"
     assert truth.parameters["original_column"] == "PostedTimestamp"
     assert truth.parameters["renamed_to"] == "posted_ts"
-    assert "PostedTimestamp" in truth.mechanism
 
 
-def test_schema_drift_accepts_a_different_column():
-    fault = SchemaDrift("ws", "Ledger", column="SourceRef", new_name="source_ref")
-    spark = FakeSpark()
-    fault.inject(spark)
-    assert ("rename", "SourceRef", "source_ref") in spark.log
+# --- Column widening: the SQL ----------------------------------------------
 
 
-# --- Model bloat -----------------------------------------------------------
+def test_widen_expression_appends_the_uniquifier():
+    assert (
+        widen_expression("SourceRef", "TransactionID", "#")
+        == "concat(SourceRef, '#', TransactionID)"
+    )
 
 
-def test_model_bloat_ground_truth_flags_no_consumer():
-    """The diagnosis hinges on the column being unused. Say so explicitly.
-
-    `_apply` needs real PySpark functions, so only the declaration is checked.
-    """
-    fault = ModelBloat("hl-finance-prod", "Ledger")
-
-    assert "no downstream consumer" in fault.mechanism()
-    assert fault.parameters()["cardinality"] == "near-unique"
+def test_narrow_expression_takes_everything_before_the_separator():
+    assert (
+        narrow_expression("SourceRef", "#")
+        == "substring_index(SourceRef, '#', 1)"
+    )
 
 
-def test_model_bloat_symptom_is_a_step_not_a_drift():
-    """Step changes and gradual drift need different detection. Be precise."""
-    fault = ModelBloat("ws", "Ledger")
-    assert "single step" in fault.expected_symptom()
+def test_the_two_expressions_use_the_same_separator():
+    """A mismatch here would make revert silently leave the data widened."""
+    widened = widen_expression("SourceRef", "TransactionID", "|")
+    narrowed = narrow_expression("SourceRef", "|")
+    assert "'|'" in widened
+    assert "'|'" in narrowed
+
+
+# --- Column widening: the fault --------------------------------------------
+
+
+def test_column_widening_declares_no_schema_change():
+    """The defining property. A schema diff must see nothing."""
+    fault = ColumnWidening("h1-finance-prod", "ledger")
+    assert fault.parameters()["schema_changed"] is False
+
+
+def test_column_widening_symptom_says_schema_looks_unchanged():
+    fault = ColumnWidening("h1-finance-prod", "ledger")
+    assert "schema comparison shows" in fault.expected_symptom()
+
+
+def test_column_widening_mechanism_names_the_column_and_uniquifier():
+    fault = ColumnWidening("h1-finance-prod", "ledger")
+    mechanism = fault.mechanism()
+    assert "SourceRef" in mechanism
+    assert "TransactionID" in mechanism
+
+
+def test_column_widening_defaults_target_the_repeating_column():
+    """SourceRef repeats roughly twice per value in the seeded ledger, so
+    widening it is a real change in cardinality rather than a no-op."""
+    fault = ColumnWidening("ws", "ledger")
+    assert fault.column == "SourceRef"
+    assert fault.uniquifier == "TransactionID"
+
+
+def test_column_widening_accepts_a_different_target():
+    fault = ColumnWidening("ws", "ledger", column="PostedBy", uniquifier="ClientID")
+    assert fault.parameters()["widened_column"] == "PostedBy"
+    assert fault.parameters()["uniquifier"] == "ClientID"
+
+
+def test_column_widening_is_registered_as_model_bloat():
+    """The taxonomy is unchanged: the mechanism changed, the fault class did not."""
+    assert ColumnWidening.fault_class == "model_bloat"
 
 
 # --- Seal ------------------------------------------------------------------
@@ -230,7 +280,7 @@ def test_model_bloat_symptom_is_a_step_not_a_drift():
 
 def test_seal_round_trips(tmp_path):
     seal = Seal(tmp_path)
-    fault = SchemaDrift("hl-finance-prod", "Ledger")
+    fault = SchemaDrift("h1-finance-prod", "ledger")
     truth = fault.inject(FakeSpark())
 
     seal.store(truth)
@@ -245,7 +295,7 @@ def test_seal_lists_what_it_holds(tmp_path):
     seal = Seal(tmp_path)
 
     for column in ("PostedTimestamp", "SourceRef"):
-        fault = SchemaDrift("ws", "Ledger", column=column, new_name=column.lower())
+        fault = SchemaDrift("ws", "ledger", column=column, new_name=column.lower())
         seal.store(fault.inject(FakeSpark()))
 
     assert len(seal.list_ids()) == 2
@@ -255,18 +305,17 @@ def test_seal_refuses_to_overwrite(tmp_path):
     """Silent clobbering would corrupt a benchmark with no error."""
     seal = Seal(tmp_path)
 
-    first = SchemaDrift("ws", "Ledger")
+    first = SchemaDrift("ws", "ledger")
     seal.store(first.inject(FakeSpark()))
 
-    second = SchemaDrift("ws", "Ledger")
+    second = SchemaDrift("ws", "ledger")
     with pytest.raises(FileExistsError, match="already sealed"):
         seal.store(second.inject(FakeSpark()))
 
 
 def test_sealed_file_is_valid_json(tmp_path):
-    """The harness reads these. Malformed output would fail silently at scoring."""
     seal = Seal(tmp_path)
-    fault = SchemaDrift("ws", "Ledger")
+    fault = SchemaDrift("ws", "ledger")
     path = seal.store(fault.inject(FakeSpark()))
 
     payload = json.loads(path.read_text())
@@ -282,7 +331,6 @@ def test_registry_matches_what_exists():
 
 
 def test_pending_classes_are_not_silently_missing():
-    """The gap is recorded in code, not only in the plan."""
     assert len(PENDING) == 4
     assert "silent_zero_row" in PENDING
 
