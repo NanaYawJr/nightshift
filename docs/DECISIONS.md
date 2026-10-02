@@ -851,3 +851,145 @@ else. A fault injected but not yet sealed is a fault that cannot be reverted.
 
 **Revisit if.** Faults ever need state that cannot be serialised — which would be
 a reason to question the fault, not the rule.
+
+---
+
+## D-023 — Silent zero-row is a header-only file, not a renamed column
+
+**Date:** 2026-10-02
+**Status:** Accepted, supersedes the mechanism in ARCHITECTURE.md
+
+**Context.** The planned mechanism was: rename a column in the landing file so
+the copy activity's explicit mapping no longer matches, with "skip incompatible
+rows" enabled so the mismatch is swallowed rather than raised.
+
+That does not work. A copy activity with explicit column mapping fails loudly
+when a mapped source column is absent — fault tolerance covers row-level type
+incompatibility, not missing columns. The run would error, the failure would be
+visible in run history, and the fault would detect itself. Not worth injecting.
+
+**Decision.** The fault writes the landing file with its header row and no data
+rows beneath it. An upstream filter matched nothing, an export failed after
+writing its header, a source system had an empty day.
+
+The copy activity reads the file, finds zero rows, writes zero rows, and reports
+success. Nothing is misconfigured. The pipeline did exactly what it was asked.
+
+Implementation backs the original file up outside the landing folder before
+truncating, so revert restores the exact rows rather than regenerating them. The
+backup sits outside `landing/` in case a pipeline is ever configured to read the
+folder rather than a named file.
+
+**Verified end to end.** Three scheduled runs after injection:
+
+| Start (UTC) | Status | Duration |
+|---|---|---|
+| 12:46 | Completed | 19.7s |
+| 13:46 | Completed | 23.4s |
+| 14:46 | Completed | 22.0s |
+
+Identical to the twenty runs before them. No error, no warning, no change in
+duration. `ledger_daily` unchanged throughout.
+
+**Consequences.** This is the strongest fault in the set and the best argument
+for the project. Every surface a person would check — run history, pipeline
+status, the workspace list, duration — reports health. The only evidence is that
+nothing arrived.
+
+It is also the only fault that touches no Spark at all, which means its tests run
+against real temporary files rather than a fake. Its behaviour in the test suite
+is its behaviour in Fabric.
+
+---
+
+## D-024 — Data Factory does not populate operationMetrics
+
+**Date:** 2026-10-02
+**Status:** Accepted, partially reverses D-012
+
+**Context.** D-012 recorded that the Delta transaction log carries
+`numOutputRows` in `operationMetrics`, verified at 2,000,000 on the ledger's
+initial commit, and concluded the `silent_zero_row` class was viable on that
+basis.
+
+That conclusion was drawn from a table Spark had written. When the Data Factory
+copy activity writes the same kind of table, the history looks different:
+
+```
+version  timestamp                operation  operationMetrics
+20       2026-10-02 11:46:21.238  Update     NULL
+19       2026-10-02 10:46:20.398  Update     NULL
+18       2026-10-02 09:46:23.382  Update     NULL
+```
+
+Twenty-one consecutive versions, every one `Update`, every one with NULL
+metrics. Not intermittent — never populated.
+
+**Decision.** Row counts are derived from the data rather than read from
+metadata. Delta time travel gives the count at any version, so the rows written
+by a commit are the difference between consecutive versions:
+
+```python
+now    = spark.table("ledger_daily").count()
+before = spark.read.format("delta").option("versionAsOf", 19).table("ledger_daily").count()
+written = now - before          # 5,000
+```
+
+**Consequences.** Slower than reading a metadata field, since it counts rows
+rather than looking one up. More robust in exchange: it works regardless of
+which engine wrote the table or what metadata that engine chose to record. Given
+that a real estate contains tables written by notebooks, pipelines, dataflows and
+shortcuts, a signal that depends on the writer's goodwill was never going to hold.
+
+The general lesson is worth keeping: a field that is present in one writer's
+output is not a contract. Verify against the writer that will actually be used.
+
+---
+
+## D-025 — A zero-row run leaves no Delta version; detection is the join
+
+**Date:** 2026-10-02
+**Status:** Accepted
+
+**Context.** With the fault injected, three scheduled pipeline runs completed
+successfully and `ledger_daily` gained no new version. Delta does not commit
+when there is nothing to write.
+
+So the fault is invisible to anything watching the transaction log. There is no
+version to inspect, no metrics to read, no row count to compare — because no
+commit happened at all. A detection rule built on version-to-version comparison,
+which is what D-024 established, would find nothing to compare and report
+nothing wrong.
+
+Duration is no help either. The runs took 19.7, 23.4 and 22.0 seconds against a
+20 to 24 second baseline for runs that moved 5,000 rows. Copy activity overhead
+dominates at this volume, so the signal people reach for first is flat.
+
+**Decision.** `silent_zero_row` is detected by joining two sources that are
+individually blind to it:
+
+- `collectors/rest_jobs` — pipeline runs, with status and start time
+- the Delta transaction log — commits, with timestamps
+
+A pipeline run that completed successfully with no corresponding commit inside
+its time window is the fault. The signal is an **absence** where one was
+expected, not a value that moved.
+
+**Consequences.** This is the first detection rule that requires two collectors
+working together, and it is a stronger demonstration for that reason. Neither
+telemetry source can see this fault alone; the correlation is the finding.
+
+It also sets a pattern worth generalising. The faults that matter most are the
+ones where nothing visibly changes, so detection will more often be about
+expected things failing to happen than about measured things moving. Rules
+written only as thresholds on observed values will systematically miss this
+category.
+
+Requires: each pipeline needs a declared expectation of what it writes, so the
+rule knows a commit was due. For `pl_ingest_ledger_daily` that is "every run
+appends to `ledger_daily`". That mapping has to be configuration, since it
+cannot be inferred from telemetry.
+
+**Also noted.** `collectors/rest_jobs` names its timestamp `start_time_utc` while
+`collectors/refresh_history` names the same concept `start_time`. Harmless today,
+a nuisance when rules read both. Worth aligning before the rules are written.
