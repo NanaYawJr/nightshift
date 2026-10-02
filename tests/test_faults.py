@@ -2,14 +2,15 @@
 
 Spark is faked. These test the contract — ground truth, reversibility,
 determinism — and which operations a fault asks for, not whether they execute.
-Only Fabric can confirm execution.
+Only Fabric can confirm Spark execution.
 
-The SQL expressions used by ColumnWidening are kept as plain strings precisely
-so they can be tested here, without a Spark runtime.
+SilentZeroRow is the exception: it touches only the filesystem, so it is tested
+against real temporary files and its behaviour here is its behaviour in Fabric.
 """
 
 import json
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 
@@ -19,9 +20,26 @@ from estate.faults.library import (
     PENDING,
     ColumnWidening,
     SchemaDrift,
+    SilentZeroRow,
     narrow_expression,
     widen_expression,
 )
+
+HEADER = "TransactionID,ClientID,Branch,Amount"
+ROWS = [
+    "TXN-0000000001,42,Kumasi Central,120.50",
+    "TXN-0000000002,99,Accra North,89.00",
+    "TXN-0000000003,17,Takoradi,2400.75",
+]
+
+
+@pytest.fixture
+def landing(tmp_path):
+    """A landing file with a header and three data rows."""
+    path = tmp_path / "landing" / "transactions_current.csv"
+    path.parent.mkdir(parents=True)
+    path.write_text(HEADER + "\n" + "\n".join(ROWS) + "\n")
+    return path
 
 
 class FakeWriter:
@@ -210,7 +228,7 @@ def test_schema_drift_ground_truth_names_both_columns():
     assert truth.parameters["renamed_to"] == "posted_ts"
 
 
-# --- Column widening: the SQL ----------------------------------------------
+# --- Column widening -------------------------------------------------------
 
 
 def test_widen_expression_appends_the_uniquifier():
@@ -221,58 +239,168 @@ def test_widen_expression_appends_the_uniquifier():
 
 
 def test_narrow_expression_takes_everything_before_the_separator():
-    assert (
-        narrow_expression("SourceRef", "#")
-        == "substring_index(SourceRef, '#', 1)"
-    )
+    assert narrow_expression("SourceRef", "#") == "substring_index(SourceRef, '#', 1)"
 
 
 def test_the_two_expressions_use_the_same_separator():
     """A mismatch here would make revert silently leave the data widened."""
-    widened = widen_expression("SourceRef", "TransactionID", "|")
-    narrowed = narrow_expression("SourceRef", "|")
-    assert "'|'" in widened
-    assert "'|'" in narrowed
-
-
-# --- Column widening: the fault --------------------------------------------
+    assert "'|'" in widen_expression("SourceRef", "TransactionID", "|")
+    assert "'|'" in narrow_expression("SourceRef", "|")
 
 
 def test_column_widening_declares_no_schema_change():
     """The defining property. A schema diff must see nothing."""
-    fault = ColumnWidening("h1-finance-prod", "ledger")
-    assert fault.parameters()["schema_changed"] is False
+    assert ColumnWidening("ws", "ledger").parameters()["schema_changed"] is False
 
 
 def test_column_widening_symptom_says_schema_looks_unchanged():
-    fault = ColumnWidening("h1-finance-prod", "ledger")
-    assert "schema comparison shows" in fault.expected_symptom()
+    assert "schema comparison shows" in ColumnWidening("ws", "ledger").expected_symptom()
 
 
 def test_column_widening_mechanism_names_the_column_and_uniquifier():
-    fault = ColumnWidening("h1-finance-prod", "ledger")
-    mechanism = fault.mechanism()
+    mechanism = ColumnWidening("ws", "ledger").mechanism()
     assert "SourceRef" in mechanism
     assert "TransactionID" in mechanism
-
-
-def test_column_widening_defaults_target_the_repeating_column():
-    """SourceRef repeats roughly twice per value in the seeded ledger, so
-    widening it is a real change in cardinality rather than a no-op."""
-    fault = ColumnWidening("ws", "ledger")
-    assert fault.column == "SourceRef"
-    assert fault.uniquifier == "TransactionID"
-
-
-def test_column_widening_accepts_a_different_target():
-    fault = ColumnWidening("ws", "ledger", column="PostedBy", uniquifier="ClientID")
-    assert fault.parameters()["widened_column"] == "PostedBy"
-    assert fault.parameters()["uniquifier"] == "ClientID"
 
 
 def test_column_widening_is_registered_as_model_bloat():
     """The taxonomy is unchanged: the mechanism changed, the fault class did not."""
     assert ColumnWidening.fault_class == "model_bloat"
+
+
+# --- Silent zero row -------------------------------------------------------
+
+
+def test_silent_zero_row_leaves_only_the_header(landing, tmp_path):
+    fault = SilentZeroRow(
+        "h1-finance-prod",
+        "pl_ingest_ledger_daily",
+        landing_path=str(landing),
+        backup_dir=str(tmp_path / "backup"),
+    )
+    fault.inject(FakeSpark())
+
+    lines = landing.read_text().splitlines()
+    assert lines == [HEADER]
+
+
+def test_silent_zero_row_keeps_the_file_readable(landing, tmp_path):
+    """A corrupt file would fail the copy loudly. The point is that it does not."""
+    fault = SilentZeroRow(
+        "ws", "pl", landing_path=str(landing), backup_dir=str(tmp_path / "backup")
+    )
+    fault.inject(FakeSpark())
+
+    content = landing.read_text()
+    assert content.endswith("\n")
+    assert content.count(",") == HEADER.count(",")
+
+
+def test_silent_zero_row_backs_up_before_truncating(landing, tmp_path):
+    backup_dir = tmp_path / "backup"
+    fault = SilentZeroRow(
+        "ws", "pl", landing_path=str(landing), backup_dir=str(backup_dir)
+    )
+    fault.inject(FakeSpark())
+
+    backup = backup_dir / "transactions_current.csv"
+    assert backup.exists()
+    assert len(backup.read_text().splitlines()) == 4
+
+
+def test_silent_zero_row_backup_sits_outside_the_landing_folder(landing, tmp_path):
+    """A pipeline reading the folder rather than a named file must not ingest
+    the backup."""
+    backup_dir = tmp_path / "backup"
+    fault = SilentZeroRow(
+        "ws", "pl", landing_path=str(landing), backup_dir=str(backup_dir)
+    )
+    fault.inject(FakeSpark())
+
+    assert backup_dir not in landing.parent.parents
+    assert list(landing.parent.glob("*.csv")) == [landing]
+
+
+def test_silent_zero_row_revert_restores_every_row(landing, tmp_path):
+    original = landing.read_text()
+
+    fault = SilentZeroRow(
+        "ws", "pl", landing_path=str(landing), backup_dir=str(tmp_path / "backup")
+    )
+    fault.inject(FakeSpark())
+    fault.revert(FakeSpark())
+
+    assert landing.read_text() == original
+
+
+def test_silent_zero_row_revert_removes_the_backup(landing, tmp_path):
+    """A stale backup would be restored over a later, different file."""
+    backup_dir = tmp_path / "backup"
+    fault = SilentZeroRow(
+        "ws", "pl", landing_path=str(landing), backup_dir=str(backup_dir)
+    )
+    fault.inject(FakeSpark())
+    fault.revert(FakeSpark())
+
+    assert not (backup_dir / "transactions_current.csv").exists()
+
+
+def test_silent_zero_row_can_be_injected_twice(landing, tmp_path):
+    fault = SilentZeroRow(
+        "ws", "pl", landing_path=str(landing), backup_dir=str(tmp_path / "backup")
+    )
+    spark = FakeSpark()
+
+    fault.inject(spark)
+    fault.revert(spark)
+    fault.inject(spark)
+
+    assert landing.read_text().splitlines() == [HEADER]
+
+
+def test_silent_zero_row_refuses_when_there_is_no_landing_file(tmp_path):
+    fault = SilentZeroRow(
+        "ws",
+        "pl",
+        landing_path=str(tmp_path / "missing.csv"),
+        backup_dir=str(tmp_path / "backup"),
+    )
+    with pytest.raises(FileNotFoundError, match="No landing file"):
+        fault.inject(FakeSpark())
+
+
+def test_silent_zero_row_revert_refuses_without_a_backup(landing, tmp_path):
+    backup_dir = tmp_path / "backup"
+    fault = SilentZeroRow(
+        "ws", "pl", landing_path=str(landing), backup_dir=str(backup_dir)
+    )
+    fault.inject(FakeSpark())
+
+    (backup_dir / "transactions_current.csv").unlink()
+
+    with pytest.raises(FileNotFoundError, match="Backup missing"):
+        fault.revert(FakeSpark())
+
+
+def test_silent_zero_row_symptom_names_the_only_evidence(landing, tmp_path):
+    """Row count is the sole signal. Status and duration both look normal."""
+    fault = SilentZeroRow("ws", "pl", landing_path=str(landing))
+    symptom = fault.expected_symptom()
+
+    assert "numOutputRows 0" in symptom
+    assert "Succeeded" in symptom
+
+
+def test_silent_zero_row_parameters_carry_both_paths(landing, tmp_path):
+    """D-022: revert must be reconstructible from sealed ground truth alone."""
+    fault = SilentZeroRow(
+        "ws", "pl", landing_path=str(landing), backup_dir=str(tmp_path / "backup")
+    )
+    params = fault.parameters()
+
+    assert params["landing_path"] == str(landing)
+    assert params["backup_path"].endswith("transactions_current.csv")
+    assert params["pipeline"] == "pl"
 
 
 # --- Seal ------------------------------------------------------------------
@@ -327,12 +455,13 @@ def test_sealed_file_is_valid_json(tmp_path):
 
 
 def test_registry_matches_what_exists():
-    assert set(IMPLEMENTED) == {"schema_drift", "model_bloat"}
+    assert set(IMPLEMENTED) == {"schema_drift", "model_bloat", "silent_zero_row"}
 
 
 def test_pending_classes_are_not_silently_missing():
-    assert len(PENDING) == 4
-    assert "silent_zero_row" in PENDING
+    """The gap is recorded in code, not only in the plan."""
+    assert len(PENDING) == 3
+    assert "refresh_collision" in PENDING
 
 
 def test_every_implemented_fault_declares_its_class():

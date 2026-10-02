@@ -1,31 +1,26 @@
-"""Fault implementations that operate on Delta tables.
+"""Fault implementations.
 
-Only two of the six classes can act on the estate as it currently stands, because
-the other four need pipelines, semantic models or a gateway — none of which exist
-yet. They are listed at the bottom as stubs so the gap is visible in code rather
-than only in a planning document.
+Three of the six classes are implemented. The rest need estate components that
+do not exist yet and are listed at the bottom so the gap is visible in code
+rather than only in a planning document.
 
-Both faults work by rewriting the table rather than altering it in place. In-place
-column renames require Delta column mapping, which is a one-way protocol upgrade
-that some readers of the table may not support. A rewrite needs no upgrade and is
-closer to how these faults arrive in real estates anyway: an upstream source sends
-a new full load in a new shape.
-
-`model_bloat` is implemented by widening an existing column, not by adding one.
-An earlier implementation added a high-cardinality column upstream and expected a
-semantic model importing the whole table to pick it up. It does not: a Power BI
-Import model pins its column list at publish time, storing each column with an
-explicit `sourceColumn`, and refresh re-reads only those. Verified against a real
-Import model — the added column never appeared. Widening an existing column
-changes no schema at all, so the model imports exactly the columns it always did
-and one of them silently stops compressing.
+Delta faults rewrite tables rather than altering them in place. In-place column
+renames require Delta column mapping, a one-way protocol upgrade that some
+readers do not support. A rewrite needs no upgrade and is closer to how these
+faults arrive in real estates: an upstream source sends a new full load in a
+new shape.
 """
 
 from __future__ import annotations
 
+import shutil
+from pathlib import Path
 from typing import Any
 
 from estate.faults.base import Fault
+
+LANDING_PATH = "/lakehouse/default/Files/landing/transactions_current.csv"
+BACKUP_DIR = "/lakehouse/default/Files/_fault_backup"
 
 
 def _overwrite(frame: Any, table: str, schema_change: bool = True) -> None:
@@ -64,9 +59,9 @@ def narrow_expression(column: str, separator: str) -> str:
 class SchemaDrift(Fault):
     """An upstream source renames a column without telling anyone.
 
-    The canonical silent failure: everything downstream that expects the old name
-    either fails loudly, or — far worse — is configured to skip what it cannot
-    find and quietly delivers nothing.
+    Everything downstream that expects the old name either fails loudly, or —
+    far worse — is configured to skip what it cannot find and quietly delivers
+    nothing.
 
     Implemented as a rewrite, not ALTER TABLE, so the table's Delta protocol is
     never upgraded. The transaction log therefore records this as an overwrite
@@ -121,19 +116,21 @@ class SchemaDrift(Fault):
 class ColumnWidening(Fault):
     """A source starts putting near-unique values in a column that used to repeat.
 
-    The mechanism behind INC-0412, corrected. A column that repeats compresses
-    well: the engine stores each distinct value once and points at it. When the
-    source begins writing a unique value per row — appending a reference, a
-    timestamp, a correlation id — the dictionary stops helping and the column's
-    cost rises sharply.
+    A column that repeats compresses well: the engine stores each distinct value
+    once and points at it. When the source begins writing a unique value per row
+    — appending a reference, a timestamp, a correlation id — the dictionary stops
+    helping and the column's cost rises sharply.
 
-    Nothing about the schema changes. The column count is identical, the types are
-    identical, the name is identical. A schema diff sees nothing. Only cardinality
-    moves, which is why diagnosing this requires comparing against history rather
-    than inspecting the current state.
+    Nothing about the schema changes. The column count is identical, the types
+    are identical, the name is identical. A schema diff sees nothing. Only
+    cardinality moves, which is why diagnosing this requires comparing against
+    history rather than inspecting the current state.
 
-    More realistic than adding a column, too. Source systems change what they put
-    in a field far more often than they change the fields themselves.
+    This replaced an earlier implementation that added a high-cardinality column
+    upstream and expected an Import model to pick it up. It does not: a Power BI
+    Import model pins its column list at publish time and refresh re-reads only
+    those columns. Verified against a real model — the added column never
+    appeared. See D-019.
     """
 
     fault_class = "model_bloat"
@@ -182,9 +179,9 @@ class ColumnWidening(Fault):
         # If the separator already occurs in the data, the transform cannot be
         # reversed — revert would truncate real values. Refuse rather than
         # corrupt the estate.
-        contaminated = table.filter(
-            F.col(self.column).contains(self.separator)
-        ).limit(1).count()
+        contaminated = (
+            table.filter(F.col(self.column).contains(self.separator)).limit(1).count()
+        )
 
         if contaminated:
             raise ValueError(
@@ -193,10 +190,7 @@ class ColumnWidening(Fault):
                 "cannot be reverted cleanly."
             )
 
-        self._revert_state = {
-            "column": self.column,
-            "separator": self.separator,
-        }
+        self._revert_state = {"column": self.column, "separator": self.separator}
 
         widened = table.withColumn(
             self.column,
@@ -216,11 +210,112 @@ class ColumnWidening(Fault):
         _overwrite(narrowed, self.target_item, schema_change=False)
 
 
+class SilentZeroRow(Fault):
+    """An upstream export writes a header and no data.
+
+    The most dangerous fault in the set, because nothing is broken. A filter
+    matched nothing, an export failed after writing its header, a source system
+    had an empty day — and the landing file arrives with twelve column names and
+    no rows beneath them.
+
+    The copy activity reads it, finds zero rows, writes zero rows, and reports
+    success. The pipeline is green. The schedule is met. Every downstream report
+    serves yesterday's figures, and will keep doing so until somebody happens to
+    notice a number looks stale.
+
+    An earlier design renamed a column in the landing file instead. That does not
+    work: a copy activity with explicit column mapping fails loudly when a mapped
+    source column is absent, and fault tolerance covers row-level type problems
+    rather than missing columns. A loud failure detects itself and is not worth
+    injecting.
+
+    The only evidence is row count. `DESCRIBE HISTORY` reports
+    `numOutputRows: 0` against a successful run — which is why that field was
+    verified before this fault was designed.
+    """
+
+    fault_class = "silent_zero_row"
+
+    def __init__(
+        self,
+        target_workspace: str,
+        target_item: str,
+        landing_path: str = LANDING_PATH,
+        backup_dir: str = BACKUP_DIR,
+        seed: int = 4417,
+    ):
+        super().__init__(target_workspace, target_item, seed)
+        self.landing_path = landing_path
+        self.backup_dir = backup_dir
+
+    def mechanism(self) -> str:
+        return (
+            f"The landing file feeding {self.target_item} was written with its "
+            "header row and no data rows. The pipeline ingested it successfully "
+            "and delivered nothing."
+        )
+
+    def expected_symptom(self) -> str:
+        return (
+            "Pipeline status Succeeded, duration normal, numOutputRows 0. "
+            "Downstream data is unchanged and therefore stale. No error anywhere."
+        )
+
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "landing_path": self.landing_path,
+            "backup_path": self._backup_path,
+            "pipeline": self.target_item,
+        }
+
+    @property
+    def _backup_path(self) -> str:
+        """Where the original file is kept. Outside the landing folder, so a
+        pipeline reading the folder rather than a named file cannot pick it up."""
+        return str(Path(self.backup_dir) / Path(self.landing_path).name)
+
+    def _apply(self, spark: Any) -> None:
+        """Spark is unused. This fault is filesystem-only.
+
+        Must run inside a Fabric notebook with the lakehouse attached, since it
+        writes through the /lakehouse/default mount.
+        """
+        source = Path(self.landing_path)
+
+        if not source.exists():
+            raise FileNotFoundError(
+                f"No landing file at {source}. Generate one with "
+                "estate.seed.landing.write_batch() before injecting."
+            )
+
+        header = source.read_text().splitlines()[0]
+
+        backup = Path(self._backup_path)
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, backup)
+
+        self._revert_state = {"backup": str(backup), "source": str(source)}
+
+        # Header and a trailing newline. Nothing else.
+        source.write_text(header + "\n")
+
+    def _undo(self, spark: Any) -> None:
+        backup = Path(self._revert_state["backup"])
+        source = Path(self._revert_state["source"])
+
+        if not backup.exists():
+            raise FileNotFoundError(
+                f"Backup missing at {backup}. The original landing file cannot "
+                "be restored; regenerate it with landing.write_batch()."
+            )
+
+        shutil.copy2(backup, source)
+        backup.unlink()
+
+
 # --------------------------------------------------------------------------
 # Not yet implementable. Each needs estate components that do not exist.
 #
-#   silent_zero_row    needs a Data Factory pipeline with a copy activity
-#                      configured to skip incompatible rows
 #   refresh_collision  needs at least two semantic models with schedules
 #   contention         needs two concurrent workloads competing for capacity
 #   gateway_timeout    needs an on-premises data gateway
@@ -231,10 +326,10 @@ class ColumnWidening(Fault):
 IMPLEMENTED = {
     SchemaDrift.fault_class: SchemaDrift,
     ColumnWidening.fault_class: ColumnWidening,
+    SilentZeroRow.fault_class: SilentZeroRow,
 }
 
 PENDING = (
-    "silent_zero_row",
     "refresh_collision",
     "contention",
     "gateway_timeout",
