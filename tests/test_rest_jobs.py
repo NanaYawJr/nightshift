@@ -35,6 +35,20 @@ def test_duration_is_computed_from_timestamps():
     assert run.duration_seconds == 630.0
 
 
+def test_api_aliases_still_match_the_wire_format():
+    """The columns were renamed; the API's own naming must not change with them."""
+    run = rest_jobs.JobRun.model_validate(
+        {
+            "id": "run1",
+            "itemId": "abc",
+            "startTimeUtc": "2026-09-11T02:00:00Z",
+            "endTimeUtc": "2026-09-11T02:10:30Z",
+        }
+    )
+    assert run.start_time is not None
+    assert run.end_time is not None
+
+
 def test_duration_is_none_while_running():
     run = rest_jobs.JobRun.model_validate(
         {"id": "run1", "itemId": "abc", "status": "InProgress"}
@@ -46,7 +60,7 @@ def test_naive_timestamps_are_treated_as_utc():
     """The live API omits the Z suffix on some responses.
 
     Regression: mixing naive and aware datetimes raised TypeError on the
-    cutoff comparison in collect().
+    cutoff comparison in collect(). See D-007.
     """
     run = rest_jobs.JobRun.model_validate(
         {
@@ -56,8 +70,8 @@ def test_naive_timestamps_are_treated_as_utc():
             "endTimeUtc": "2026-09-11T02:10:30",
         }
     )
-    assert run.start_time_utc.tzinfo is not None
-    assert run.end_time_utc.tzinfo is not None
+    assert run.start_time.tzinfo is not None
+    assert run.end_time.tzinfo is not None
     assert run.duration_seconds == 630.0
 
 
@@ -66,8 +80,7 @@ def test_naive_timestamp_is_comparable_to_aware_cutoff():
     run = rest_jobs.JobRun.model_validate(
         {"id": "run1", "itemId": "abc", "startTimeUtc": "2020-01-01T00:00:00"}
     )
-    cutoff = datetime.now(timezone.utc)
-    assert run.start_time_utc < cutoff
+    assert run.start_time < datetime.now(timezone.utc)
 
 
 def test_unsupported_item_type_yields_nothing(monkeypatch):
@@ -102,7 +115,7 @@ def test_collect_skips_runs_older_than_cutoff(monkeypatch):
     monkeypatch.setattr(
         rest_jobs,
         "list_workspaces",
-        lambda: [{"id": "ws1", "displayName": "hl-finance-prod"}],
+        lambda: [{"id": "ws1", "displayName": "h1-finance-prod"}],
     )
     monkeypatch.setattr(
         rest_jobs,
@@ -174,3 +187,52 @@ def test_collect_handles_runs_with_no_start_time(monkeypatch):
 
     counts = rest_jobs.collect(since_days=30)
     assert counts["job_runs"] == 1
+
+
+def test_written_columns_match_refresh_history(monkeypatch):
+    """Both collectors must name the same concept the same way.
+
+    The silent_zero_row rule joins job_runs against the Delta log and reads
+    refresh_runs alongside it. Two names for one concept is a bug waiting to
+    happen. See D-025.
+    """
+    monkeypatch.setattr(
+        rest_jobs, "list_workspaces", lambda: [{"id": "ws1", "displayName": "ws"}]
+    )
+    monkeypatch.setattr(
+        rest_jobs,
+        "list_items",
+        lambda ws: iter(
+            [
+                rest_jobs.Item(
+                    id="i1", displayName="pl", type="DataPipeline", workspaceId="ws1"
+                )
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        rest_jobs,
+        "list_job_runs",
+        lambda ws, item: iter(
+            [
+                rest_jobs.JobRun(
+                    id="r1", itemId="i1", startTimeUtc=datetime.now(timezone.utc)
+                )
+            ]
+        ),
+    )
+
+    captured: dict[str, list] = {}
+    monkeypatch.setattr(
+        rest_jobs.storage,
+        "write",
+        lambda dataset, rows: captured.update({dataset: rows}),
+    )
+
+    rest_jobs.collect()
+
+    columns = set(captured["job_runs"][0])
+    assert "start_time" in columns
+    assert "end_time" in columns
+    assert "start_time_utc" not in columns
+    assert "end_time_utc" not in columns

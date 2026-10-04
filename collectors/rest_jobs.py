@@ -11,7 +11,14 @@ successes and refresh collisions are all derived from it.
 
 Note: semantic model refreshes are NOT in the Fabric jobs API. They live in the
 Power BI refresh history endpoint and are collected separately by
-`collectors.model_stats`. This collector covers the schedulable Fabric item types.
+`collectors.refresh_history`. This collector covers the schedulable Fabric item
+types.
+
+Timestamp columns are named `start_time` and `end_time`, matching
+`refresh_history`. They were previously `start_time_utc` / `end_time_utc`; the
+`silent_zero_row` rule reads both collectors and two names for one concept is a
+bug waiting to happen. The API's own `startTimeUtc` naming is preserved in the
+Pydantic aliases, so nothing about the HTTP side changes.
 """
 
 import argparse
@@ -54,22 +61,20 @@ class JobRun(BaseModel):
     job_type: str | None = Field(default=None, alias="jobType")
     invoke_type: str | None = Field(default=None, alias="invokeType")
     status: str | None = None
-    start_time_utc: datetime | None = Field(default=None, alias="startTimeUtc")
-    end_time_utc: datetime | None = Field(default=None, alias="endTimeUtc")
-    failure_reason: dict[str, Any] | None = Field(
-        default=None, alias="failureReason"
-    )
+    start_time: datetime | None = Field(default=None, alias="startTimeUtc")
+    end_time: datetime | None = Field(default=None, alias="endTimeUtc")
+    failure_reason: dict[str, Any] | None = Field(default=None, alias="failureReason")
 
     model_config = {"populate_by_name": True, "extra": "ignore"}
 
-    @field_validator("start_time_utc", "end_time_utc", mode="after")
+    @field_validator("start_time", "end_time", mode="after")
     @classmethod
     def assume_utc(cls, value: datetime | None) -> datetime | None:
         """The API omits the timezone marker on some responses.
 
         Without this, naive and aware datetimes end up mixed in the same field
         and any comparison between them raises TypeError. These timestamps are
-        documented as UTC, so attaching the timezone is safe.
+        documented as UTC, so attaching the timezone is safe. See D-007.
         """
         if value is not None and value.tzinfo is None:
             return value.replace(tzinfo=timezone.utc)
@@ -77,8 +82,8 @@ class JobRun(BaseModel):
 
     @property
     def duration_seconds(self) -> float | None:
-        if self.start_time_utc and self.end_time_utc:
-            return (self.end_time_utc - self.start_time_utc).total_seconds()
+        if self.start_time and self.end_time:
+            return (self.end_time - self.start_time).total_seconds()
         return None
 
 
@@ -134,7 +139,7 @@ def collect(since_days: int = 30) -> dict[str, int]:
                 continue
 
             for run in list_job_runs(ws_id, item.id):
-                if run.start_time_utc and run.start_time_utc < cutoff:
+                if run.start_time and run.start_time < cutoff:
                     continue
 
                 run_rows.append(
@@ -148,8 +153,8 @@ def collect(since_days: int = 30) -> dict[str, int]:
                         "job_type": run.job_type,
                         "invoke_type": run.invoke_type,
                         "status": run.status,
-                        "start_time_utc": run.start_time_utc,
-                        "end_time_utc": run.end_time_utc,
+                        "start_time": run.start_time,
+                        "end_time": run.end_time,
                         "duration_seconds": run.duration_seconds,
                         "failure_reason": (
                             str(run.failure_reason) if run.failure_reason else None
