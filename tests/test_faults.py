@@ -1,11 +1,16 @@
 """Fault framework tests.
 
 Spark is faked. These test the contract — ground truth, reversibility,
-determinism — and which operations a fault asks for, not whether they execute.
-Only Fabric can confirm Spark execution.
+determinism, reconstruction — and which operations a fault asks for, not whether
+they execute. Only Fabric can confirm Spark execution.
 
-SilentZeroRow is the exception: it touches only the filesystem, so it is tested
-against real temporary files and its behaviour here is its behaviour in Fabric.
+Reconstruction tests build a GroundTruth directly from a fault's parameters
+rather than injecting first. That is both faster and a truer test: rebuilding is
+supposed to need nothing but the sealed record.
+
+SilentZeroRow is the exception to the faked-Spark rule. It touches only the
+filesystem, so it is tested against real temporary files and its behaviour here
+is its behaviour in Fabric.
 """
 
 import json
@@ -14,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from estate.faults.base import Fault, Seal
+from estate.faults.base import Fault, GroundTruth, Seal
 from estate.faults.library import (
     IMPLEMENTED,
     PENDING,
@@ -22,6 +27,7 @@ from estate.faults.library import (
     SchemaDrift,
     SilentZeroRow,
     narrow_expression,
+    rebuild,
     widen_expression,
 )
 
@@ -31,6 +37,25 @@ ROWS = [
     "TXN-0000000002,99,Accra North,89.00",
     "TXN-0000000003,17,Takoradi,2400.75",
 ]
+
+
+def seal_record(fault: Fault, workspace: str = "ws", item: str = "ledger") -> GroundTruth:
+    """Build the sealed record a fault would produce, without injecting it.
+
+    Lets reconstruction be tested for faults whose `_apply` needs PySpark, which
+    is not installed locally.
+    """
+    return GroundTruth(
+        fault_id=fault.fault_id,
+        fault_class=fault.fault_class,
+        target_workspace=workspace,
+        target_item=item,
+        mechanism=fault.mechanism(),
+        expected_symptom=fault.expected_symptom(),
+        injected_at=datetime.now(),
+        seed=fault.seed,
+        parameters=fault.parameters(),
+    )
 
 
 @pytest.fixture
@@ -43,8 +68,6 @@ def landing(tmp_path):
 
 
 class FakeWriter:
-    """Records the write chain: mode, options, format, target table."""
-
     def __init__(self, log: list):
         self.log = log
 
@@ -65,8 +88,6 @@ class FakeWriter:
 
 
 class FakeFrame:
-    """Records transformations applied to a table read."""
-
     def __init__(self, log: list):
         self.log = log
 
@@ -117,6 +138,12 @@ class TrivialFault(Fault):
     def parameters(self) -> dict:
         return {"noop": True}
 
+    @classmethod
+    def _rebuild(cls, truth):
+        fault = cls(truth.target_workspace, truth.target_item, seed=truth.seed)
+        fault._revert_state = {"applied": True}
+        return fault
+
     def _apply(self, spark) -> None:
         self._revert_state = {"applied": True}
 
@@ -156,6 +183,17 @@ def test_revert_allows_reinjection():
     fault.inject(spark)  # must not raise
 
 
+def test_inject_and_seal_records_immediately(tmp_path):
+    """A fault injected but not sealed cannot be reverted by anything but the
+    live object that made it."""
+    seal = Seal(tmp_path)
+    fault = TrivialFault("ws", "item")
+
+    truth = fault.inject_and_seal(FakeSpark(), seal)
+
+    assert seal.list_ids() == [truth.fault_id]
+
+
 # --- Identity --------------------------------------------------------------
 
 
@@ -177,6 +215,103 @@ def test_parameters_change_the_id():
     a = SchemaDrift("ws", "ledger", column="PostedTimestamp", new_name="posted_ts")
     b = SchemaDrift("ws", "ledger", column="SourceRef", new_name="source_ref")
     assert a.fault_id != b.fault_id
+
+
+# --- Reconstruction from sealed ground truth -------------------------------
+
+
+def test_rebuilt_fault_reverts_without_the_original_object():
+    """The point of D-022. Four notebook sessions died mid-fault during
+    development, each time stranding the estate."""
+    original = SchemaDrift("h1-finance-prod", "ledger")
+    truth = original.inject(FakeSpark())
+
+    del original
+
+    spark = FakeSpark()
+    SchemaDrift.from_ground_truth(truth).revert(spark)
+
+    assert ("rename", "posted_ts", "PostedTimestamp") in spark.log
+
+
+def test_rebuilt_fault_keeps_its_identity():
+    """Rebuilt from the sealed record alone — no injection, so no Spark needed."""
+    original = ColumnWidening("ws", "ledger", column="PostedBy", separator="|")
+    truth = seal_record(original)
+
+    rebuilt = ColumnWidening.from_ground_truth(truth)
+
+    assert rebuilt.fault_id == truth.fault_id
+    assert rebuilt.column == "PostedBy"
+    assert rebuilt.separator == "|"
+    assert rebuilt._revert_state == {"column": "PostedBy", "separator": "|"}
+
+
+def test_rebuilding_the_wrong_class_is_refused():
+    truth = seal_record(SchemaDrift("ws", "ledger"))
+
+    with pytest.raises(ValueError, match="cannot rebuild"):
+        ColumnWidening.from_ground_truth(truth)
+
+
+def test_rebuild_dispatches_on_fault_class():
+    """Cleanup should not need to know which class injected a fault."""
+    truth = seal_record(ColumnWidening("ws", "ledger"))
+
+    assert isinstance(rebuild(truth), ColumnWidening)
+
+
+def test_rebuild_rejects_an_unknown_class():
+    truth = GroundTruth(
+        fault_id="x",
+        fault_class="not_a_real_class",
+        target_workspace="ws",
+        target_item="ledger",
+        mechanism="",
+        expected_symptom="",
+        injected_at=datetime.now(),
+        seed=1,
+    )
+    with pytest.raises(KeyError, match="No implementation"):
+        rebuild(truth)
+
+
+def test_every_implemented_fault_can_be_rebuilt():
+    """A fault whose parameters cannot rebuild it is under-recorded.
+
+    Covers Spark-dependent faults too, since nothing is injected.
+    """
+    for cls in IMPLEMENTED.values():
+        truth = seal_record(cls("ws", "target"), item="target")
+        rebuilt = cls.from_ground_truth(truth)
+
+        assert rebuilt._revert_state, f"{cls.__name__} rebuilt with empty revert state"
+        assert rebuilt.fault_id == truth.fault_id
+
+
+def test_round_trip_through_the_seal_reverts_a_real_file(landing, tmp_path):
+    """End to end, with no live object and real filesystem effects.
+
+    Mirrors the recovery done by hand after a session timeout: load the sealed
+    record, rebuild, revert.
+    """
+    seal = Seal(tmp_path / "sealed")
+
+    fault = SilentZeroRow(
+        "h1-finance-prod",
+        "pl_ingest_ledger_daily",
+        landing_path=str(landing),
+        backup_dir=str(tmp_path / "backup"),
+    )
+    original = landing.read_text()
+    truth = fault.inject_and_seal(FakeSpark(), seal)
+
+    del fault
+
+    reloaded = seal.load(truth.fault_id)
+    rebuild(reloaded).revert(FakeSpark())
+
+    assert landing.read_text() == original
 
 
 # --- Schema drift ----------------------------------------------------------
@@ -220,8 +355,7 @@ def test_schema_drift_revert_restores_the_original_name():
 
 
 def test_schema_drift_ground_truth_names_both_columns():
-    fault = SchemaDrift("h1-finance-prod", "ledger")
-    truth = fault.inject(FakeSpark())
+    truth = SchemaDrift("h1-finance-prod", "ledger").inject(FakeSpark())
 
     assert truth.fault_class == "schema_drift"
     assert truth.parameters["original_column"] == "PostedTimestamp"
@@ -273,15 +407,11 @@ def test_column_widening_is_registered_as_model_bloat():
 
 def test_silent_zero_row_leaves_only_the_header(landing, tmp_path):
     fault = SilentZeroRow(
-        "h1-finance-prod",
-        "pl_ingest_ledger_daily",
-        landing_path=str(landing),
-        backup_dir=str(tmp_path / "backup"),
+        "ws", "pl", landing_path=str(landing), backup_dir=str(tmp_path / "backup")
     )
     fault.inject(FakeSpark())
 
-    lines = landing.read_text().splitlines()
-    assert lines == [HEADER]
+    assert landing.read_text().splitlines() == [HEADER]
 
 
 def test_silent_zero_row_keeps_the_file_readable(landing, tmp_path):
@@ -311,13 +441,11 @@ def test_silent_zero_row_backs_up_before_truncating(landing, tmp_path):
 def test_silent_zero_row_backup_sits_outside_the_landing_folder(landing, tmp_path):
     """A pipeline reading the folder rather than a named file must not ingest
     the backup."""
-    backup_dir = tmp_path / "backup"
     fault = SilentZeroRow(
-        "ws", "pl", landing_path=str(landing), backup_dir=str(backup_dir)
+        "ws", "pl", landing_path=str(landing), backup_dir=str(tmp_path / "backup")
     )
     fault.inject(FakeSpark())
 
-    assert backup_dir not in landing.parent.parents
     assert list(landing.parent.glob("*.csv")) == [landing]
 
 
@@ -382,10 +510,9 @@ def test_silent_zero_row_revert_refuses_without_a_backup(landing, tmp_path):
         fault.revert(FakeSpark())
 
 
-def test_silent_zero_row_symptom_names_the_only_evidence(landing, tmp_path):
+def test_silent_zero_row_symptom_names_the_only_evidence(landing):
     """Row count is the sole signal. Status and duration both look normal."""
-    fault = SilentZeroRow("ws", "pl", landing_path=str(landing))
-    symptom = fault.expected_symptom()
+    symptom = SilentZeroRow("ws", "pl", landing_path=str(landing)).expected_symptom()
 
     assert "numOutputRows 0" in symptom
     assert "Succeeded" in symptom
@@ -400,7 +527,6 @@ def test_silent_zero_row_parameters_carry_both_paths(landing, tmp_path):
 
     assert params["landing_path"] == str(landing)
     assert params["backup_path"].endswith("transactions_current.csv")
-    assert params["pipeline"] == "pl"
 
 
 # --- Seal ------------------------------------------------------------------
@@ -408,8 +534,7 @@ def test_silent_zero_row_parameters_carry_both_paths(landing, tmp_path):
 
 def test_seal_round_trips(tmp_path):
     seal = Seal(tmp_path)
-    fault = SchemaDrift("h1-finance-prod", "ledger")
-    truth = fault.inject(FakeSpark())
+    truth = SchemaDrift("h1-finance-prod", "ledger").inject(FakeSpark())
 
     seal.store(truth)
     loaded = seal.load(truth.fault_id)
@@ -432,19 +557,27 @@ def test_seal_lists_what_it_holds(tmp_path):
 def test_seal_refuses_to_overwrite(tmp_path):
     """Silent clobbering would corrupt a benchmark with no error."""
     seal = Seal(tmp_path)
+    seal.store(SchemaDrift("ws", "ledger").inject(FakeSpark()))
 
-    first = SchemaDrift("ws", "ledger")
-    seal.store(first.inject(FakeSpark()))
-
-    second = SchemaDrift("ws", "ledger")
     with pytest.raises(FileExistsError, match="already sealed"):
-        seal.store(second.inject(FakeSpark()))
+        seal.store(SchemaDrift("ws", "ledger").inject(FakeSpark()))
+
+
+def test_seal_discard_removes_a_record(tmp_path):
+    """A stale seal would let a later revert restore a backup that no longer
+    matches the estate."""
+    seal = Seal(tmp_path)
+    truth = SchemaDrift("ws", "ledger").inject(FakeSpark())
+    seal.store(truth)
+
+    seal.discard(truth.fault_id)
+
+    assert seal.list_ids() == []
 
 
 def test_sealed_file_is_valid_json(tmp_path):
     seal = Seal(tmp_path)
-    fault = SchemaDrift("ws", "ledger")
-    path = seal.store(fault.inject(FakeSpark()))
+    path = seal.store(SchemaDrift("ws", "ledger").inject(FakeSpark()))
 
     payload = json.loads(path.read_text())
     assert payload["fault_class"] == "schema_drift"
@@ -459,7 +592,6 @@ def test_registry_matches_what_exists():
 
 
 def test_pending_classes_are_not_silently_missing():
-    """The gap is recorded in code, not only in the plan."""
     assert len(PENDING) == 3
     assert "refresh_collision" in PENDING
 

@@ -9,6 +9,9 @@ renames require Delta column mapping, a one-way protocol upgrade that some
 readers do not support. A rewrite needs no upgrade and is closer to how these
 faults arrive in real estates: an upstream source sends a new full load in a
 new shape.
+
+Every fault implements `_rebuild`, so any of them can be reverted from its
+sealed record alone. See D-022.
 """
 
 from __future__ import annotations
@@ -17,7 +20,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from estate.faults.base import Fault
+from estate.faults.base import Fault, GroundTruth
 
 LANDING_PATH = "/lakehouse/default/Files/landing/transactions_current.csv"
 BACKUP_DIR = "/lakehouse/default/Files/_fault_backup"
@@ -98,6 +101,23 @@ class SchemaDrift(Fault):
     def parameters(self) -> dict[str, Any]:
         return {"original_column": self.column, "renamed_to": self.new_name}
 
+    @classmethod
+    def _rebuild(cls, truth: GroundTruth) -> "SchemaDrift":
+        params = truth.parameters
+
+        fault = cls(
+            truth.target_workspace,
+            truth.target_item,
+            column=params["original_column"],
+            new_name=params["renamed_to"],
+            seed=truth.seed,
+        )
+        fault._revert_state = {
+            "from": params["renamed_to"],
+            "to": params["original_column"],
+        }
+        return fault
+
     def _apply(self, spark: Any) -> None:
         self._revert_state = {"from": self.new_name, "to": self.column}
 
@@ -129,8 +149,7 @@ class ColumnWidening(Fault):
     This replaced an earlier implementation that added a high-cardinality column
     upstream and expected an Import model to pick it up. It does not: a Power BI
     Import model pins its column list at publish time and refresh re-reads only
-    those columns. Verified against a real model — the added column never
-    appeared. See D-019.
+    those columns. See D-019.
     """
 
     fault_class = "model_bloat"
@@ -170,6 +189,24 @@ class ColumnWidening(Fault):
             "separator": self.separator,
             "schema_changed": False,
         }
+
+    @classmethod
+    def _rebuild(cls, truth: GroundTruth) -> "ColumnWidening":
+        params = truth.parameters
+
+        fault = cls(
+            truth.target_workspace,
+            truth.target_item,
+            column=params["widened_column"],
+            uniquifier=params["uniquifier"],
+            separator=params["separator"],
+            seed=truth.seed,
+        )
+        fault._revert_state = {
+            "column": params["widened_column"],
+            "separator": params["separator"],
+        }
+        return fault
 
     def _apply(self, spark: Any) -> None:
         from pyspark.sql import functions as F
@@ -215,23 +252,19 @@ class SilentZeroRow(Fault):
 
     The most dangerous fault in the set, because nothing is broken. A filter
     matched nothing, an export failed after writing its header, a source system
-    had an empty day — and the landing file arrives with twelve column names and
-    no rows beneath them.
+    had an empty day — and the landing file arrives with its column names and no
+    rows beneath them.
 
     The copy activity reads it, finds zero rows, writes zero rows, and reports
-    success. The pipeline is green. The schedule is met. Every downstream report
-    serves yesterday's figures, and will keep doing so until somebody happens to
-    notice a number looks stale.
+    success. The pipeline is green, the schedule is met, and every downstream
+    report serves yesterday's figures until somebody notices a number looks
+    stale.
 
-    An earlier design renamed a column in the landing file instead. That does not
-    work: a copy activity with explicit column mapping fails loudly when a mapped
-    source column is absent, and fault tolerance covers row-level type problems
-    rather than missing columns. A loud failure detects itself and is not worth
-    injecting.
-
-    The only evidence is row count. `DESCRIBE HISTORY` reports
-    `numOutputRows: 0` against a successful run — which is why that field was
-    verified before this fault was designed.
+    Verified: three scheduled runs after injection all completed in 19 to 23
+    seconds, matching the baseline exactly, and no Delta version was written at
+    all — Delta does not commit when there is nothing to write. Detection is
+    therefore a join between pipeline run history and the transaction log, not a
+    measurement of either. See D-025.
     """
 
     fault_class = "silent_zero_row"
@@ -273,6 +306,24 @@ class SilentZeroRow(Fault):
         """Where the original file is kept. Outside the landing folder, so a
         pipeline reading the folder rather than a named file cannot pick it up."""
         return str(Path(self.backup_dir) / Path(self.landing_path).name)
+
+    @classmethod
+    def _rebuild(cls, truth: GroundTruth) -> "SilentZeroRow":
+        params = truth.parameters
+        backup = Path(params["backup_path"])
+
+        fault = cls(
+            truth.target_workspace,
+            truth.target_item,
+            landing_path=params["landing_path"],
+            backup_dir=str(backup.parent),
+            seed=truth.seed,
+        )
+        fault._revert_state = {
+            "backup": params["backup_path"],
+            "source": params["landing_path"],
+        }
+        return fault
 
     def _apply(self, spark: Any) -> None:
         """Spark is unused. This fault is filesystem-only.
@@ -319,8 +370,6 @@ class SilentZeroRow(Fault):
 #   refresh_collision  needs at least two semantic models with schedules
 #   contention         needs two concurrent workloads competing for capacity
 #   gateway_timeout    needs an on-premises data gateway
-#
-# Listed here rather than only in the plan so the gap is visible in the code.
 # --------------------------------------------------------------------------
 
 IMPLEMENTED = {
@@ -334,3 +383,22 @@ PENDING = (
     "contention",
     "gateway_timeout",
 )
+
+
+def rebuild(truth: GroundTruth) -> Fault:
+    """Reconstruct any fault from its sealed record, without knowing its class.
+
+    The entry point for cleanup: given a sealed JSON file, this returns an object
+    whose `revert(spark)` undoes the fault. Nothing else is needed — no live
+    session, no memory of what was injected.
+
+        truth = Seal().load(fault_id)
+        rebuild(truth).revert(spark)
+    """
+    if truth.fault_class not in IMPLEMENTED:
+        raise KeyError(
+            f"No implementation for fault class '{truth.fault_class}'. "
+            f"Known: {sorted(IMPLEMENTED)}"
+        )
+
+    return IMPLEMENTED[truth.fault_class].from_ground_truth(truth)

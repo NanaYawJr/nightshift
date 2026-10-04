@@ -5,7 +5,7 @@ matters more than any individual fault: it is what lets the evaluation harness
 inject something, wait for detection, and score the result without any part of
 the detection path knowing what was done.
 
-Three rules, and they are the whole design:
+Four rules, and they are the whole design:
 
 1. A fault knows its own ground truth. It states, in structured form, what it
    did and what the correct diagnosis would be. That statement is sealed away
@@ -16,6 +16,12 @@ Three rules, and they are the whole design:
 
 3. A fault is deterministic given a seed. The same seed produces the same fault
    on the same target, so a failed diagnosis can be reproduced and debugged.
+
+4. A fault is revertible from its sealed record alone. `from_ground_truth()`
+   rebuilds an injected instance from JSON, with no live object required. Four
+   separate notebook sessions timed out between injection and revert during
+   development, each time stranding the estate until it was restored by hand.
+   A thirty-fault benchmark run will outlast any session.
 
 Faults do not touch Spark directly in their constructors. They describe what
 they will do, and `inject(spark)` performs it. This keeps the declaration
@@ -39,6 +45,9 @@ class GroundTruth:
 
     `mechanism` is the specific thing that changed, stated plainly enough that a
     human scorer can compare it to the agent's diagnosis without interpretation.
+
+    `parameters` must carry everything `_undo` needs, because it is the only
+    input `from_ground_truth` has to work from.
     """
 
     fault_id: str
@@ -79,13 +88,15 @@ class Fault(ABC):
         Includes a digest of the fault's parameters. Two faults of the same class
         on the same target differ only in their parameters — without the digest
         they collide, and the second silently overwrites the first's sealed
-        ground truth. Found by a test rather than by a corrupted benchmark.
+        ground truth.
         """
         digest = hashlib.sha1(
             json.dumps(self.parameters(), sort_keys=True).encode()
         ).hexdigest()[:6]
 
         return f"{self.fault_class}-{self.target_item}-{digest}-{self.seed}"
+
+    # --- What each fault must declare -------------------------------------
 
     @abstractmethod
     def mechanism(self) -> str:
@@ -97,10 +108,11 @@ class Fault(ABC):
 
     @abstractmethod
     def parameters(self) -> dict[str, Any]:
-        """Anything a scorer needs beyond the mechanism sentence.
+        """Everything a scorer needs, and everything `_undo` needs.
 
-        Also feeds `fault_id`, so this must distinguish two otherwise identical
-        faults on the same target.
+        Feeds `fault_id`, so it must distinguish two otherwise identical faults
+        on the same target. Feeds `from_ground_truth`, so it must be sufficient
+        to rebuild a revertible instance with no other input.
         """
 
     @abstractmethod
@@ -111,6 +123,17 @@ class Fault(ABC):
     def _undo(self, spark: Any) -> None:
         """Restore the prior state using `self._revert_state`."""
 
+    @classmethod
+    @abstractmethod
+    def _rebuild(cls, truth: GroundTruth) -> "Fault":
+        """Construct an instance from sealed parameters, with `_revert_state` set.
+
+        The counterpart to `parameters()`. If a fault cannot implement this, its
+        parameters are not recording enough.
+        """
+
+    # --- Lifecycle ---------------------------------------------------------
+
     def inject(self, spark: Any) -> GroundTruth:
         if self._injected_at is not None:
             raise RuntimeError(f"{self.fault_id} is already injected")
@@ -120,6 +143,17 @@ class Fault(ABC):
 
         return self.ground_truth()
 
+    def inject_and_seal(self, spark: Any, seal: "Seal") -> GroundTruth:
+        """Inject and record in one step.
+
+        A fault injected but not yet sealed cannot be reverted by anything but
+        the live object that created it — which is the failure this whole
+        mechanism exists to prevent. Sealing is not an optional follow-up.
+        """
+        truth = self.inject(spark)
+        seal.store(truth)
+        return truth
+
     def revert(self, spark: Any) -> None:
         if self._injected_at is None:
             raise RuntimeError(f"{self.fault_id} was never injected")
@@ -127,6 +161,24 @@ class Fault(ABC):
         self._undo(spark)
         self._injected_at = None
         self._revert_state = {}
+
+    @classmethod
+    def from_ground_truth(cls, truth: GroundTruth) -> "Fault":
+        """Rebuild an injected instance from its sealed record.
+
+        The returned object behaves as though it had just been injected: calling
+        `revert(spark)` on it undoes the fault. No live session required, so a
+        crashed benchmark run can be cleaned up by any process that can read the
+        seal.
+        """
+        if truth.fault_class != cls.fault_class:
+            raise ValueError(
+                f"{cls.__name__} cannot rebuild a '{truth.fault_class}' fault"
+            )
+
+        fault = cls._rebuild(truth)
+        fault._injected_at = truth.injected_at
+        return fault
 
     def ground_truth(self) -> GroundTruth:
         if self._injected_at is None:
@@ -186,3 +238,11 @@ class Seal:
 
     def list_ids(self) -> list[str]:
         return sorted(p.stem for p in self.path.glob("*.json"))
+
+    def discard(self, fault_id: str) -> None:
+        """Remove a sealed record after its fault has been reverted.
+
+        Leaving it would let a later revert restore a backup that no longer
+        matches the estate.
+        """
+        (self.path / f"{fault_id}.json").unlink(missing_ok=True)
