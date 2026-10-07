@@ -2,13 +2,32 @@
 
 import time
 
+import pytest
+
 from common import auth
 from common.config import settings
 
 
-def setup_function():
-    """Each test starts with an empty cache."""
+class FakeApp:
+    """Stands in for MSAL's ConfidentialClientApplication."""
+
+    def __init__(self, **kwargs):
+        pass
+
+    def acquire_token_for_client(self, scopes):
+        return {"access_token": f"token-for-{scopes[0]}", "expires_in": 3600}
+
+
+@pytest.fixture(autouse=True)
+def clean_cache(monkeypatch):
+    """Each test starts with an empty cache, and outside Fabric."""
     auth._cache.clear()
+    monkeypatch.setattr(auth, "in_fabric", lambda: False)
+    yield
+    auth._cache.clear()
+
+
+# --- Caching ---------------------------------------------------------------
 
 
 def test_cached_token_is_reused(monkeypatch):
@@ -20,7 +39,8 @@ def test_cached_token_is_reused(monkeypatch):
     def fail(*args, **kwargs):
         raise AssertionError("MSAL should not be called when cache is valid")
 
-    monkeypatch.setattr(auth.msal, "ConfidentialClientApplication", fail)
+    monkeypatch.setattr(auth, "msal", type("M", (), {"ConfidentialClientApplication": fail}))
+
     assert auth.get_token() == "cached-value"
 
 
@@ -30,28 +50,18 @@ def test_expiring_token_is_refreshed(monkeypatch):
         "expires_at": time.time() + 60,  # inside the 300s margin
     }
 
-    class FakeApp:
-        def __init__(self, **kwargs):
-            pass
+    monkeypatch.setattr(
+        auth, "msal", type("M", (), {"ConfidentialClientApplication": FakeApp})
+    )
 
-        def acquire_token_for_client(self, scopes):
-            return {"access_token": "fresh-value", "expires_in": 3600}
-
-    monkeypatch.setattr(auth.msal, "ConfidentialClientApplication", FakeApp)
-    assert auth.get_token() == "fresh-value"
+    assert "stale-value" not in auth.get_token()
 
 
 def test_scopes_do_not_share_a_token(monkeypatch):
     """A Fabric token must never be handed to a Power BI call, or vice versa."""
-
-    class FakeApp:
-        def __init__(self, **kwargs):
-            pass
-
-        def acquire_token_for_client(self, scopes):
-            return {"access_token": f"token-for-{scopes[0]}", "expires_in": 3600}
-
-    monkeypatch.setattr(auth.msal, "ConfidentialClientApplication", FakeApp)
+    monkeypatch.setattr(
+        auth, "msal", type("M", (), {"ConfidentialClientApplication": FakeApp})
+    )
 
     fabric = auth.get_token(settings.fabric_scope)
     powerbi = auth.get_token(settings.powerbi_scope)
@@ -62,12 +72,68 @@ def test_scopes_do_not_share_a_token(monkeypatch):
 
 
 def test_default_scope_is_fabric(monkeypatch):
-    class FakeApp:
-        def __init__(self, **kwargs):
-            pass
+    monkeypatch.setattr(
+        auth, "msal", type("M", (), {"ConfidentialClientApplication": FakeApp})
+    )
 
-        def acquire_token_for_client(self, scopes):
-            return {"access_token": f"token-for-{scopes[0]}", "expires_in": 3600}
-
-    monkeypatch.setattr(auth.msal, "ConfidentialClientApplication", FakeApp)
     assert settings.fabric_scope in auth.get_token()
+
+
+def test_missing_msal_outside_fabric_is_a_clear_error(monkeypatch):
+    """Rather than an AttributeError on None, which says nothing useful."""
+    monkeypatch.setattr(auth, "msal", None)
+
+    with pytest.raises(RuntimeError, match="not a Fabric notebook"):
+        auth.get_token()
+
+
+# --- Fabric path -----------------------------------------------------------
+
+
+class FakeCredentials:
+    def __init__(self, log: list):
+        self.log = log
+
+    def getToken(self, audience):
+        self.log.append(audience)
+        return f"fabric-token-{audience}"
+
+
+def test_in_fabric_uses_the_notebook_identity(monkeypatch):
+    """No secret, no service principal. The whole reason this path exists."""
+    log: list[str] = []
+
+    fake_notebookutils = type("N", (), {"credentials": FakeCredentials(log)})
+    monkeypatch.setitem(__import__("sys").modules, "notebookutils", fake_notebookutils)
+    monkeypatch.setattr(auth, "in_fabric", lambda: True)
+
+    token = auth.get_token()
+
+    assert token == "fabric-token-pbi"
+    assert log == ["pbi"]
+
+
+def test_in_fabric_never_touches_msal(monkeypatch):
+    """A Fabric runtime may not have msal installed at all."""
+    log: list[str] = []
+
+    fake_notebookutils = type("N", (), {"credentials": FakeCredentials(log)})
+    monkeypatch.setitem(__import__("sys").modules, "notebookutils", fake_notebookutils)
+    monkeypatch.setattr(auth, "in_fabric", lambda: True)
+    monkeypatch.setattr(auth, "msal", None)
+
+    assert auth.get_token() == "fabric-token-pbi"
+
+
+def test_both_scopes_map_to_the_pbi_audience(monkeypatch):
+    """Fabric and Power BI REST both accept it, so one token serves both."""
+    log: list[str] = []
+
+    fake_notebookutils = type("N", (), {"credentials": FakeCredentials(log)})
+    monkeypatch.setitem(__import__("sys").modules, "notebookutils", fake_notebookutils)
+    monkeypatch.setattr(auth, "in_fabric", lambda: True)
+
+    auth.get_token(settings.fabric_scope)
+    auth.get_token(settings.powerbi_scope)
+
+    assert log == ["pbi", "pbi"]
