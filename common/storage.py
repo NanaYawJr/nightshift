@@ -94,6 +94,18 @@ class LakehouseDelta:
     def write(self, dataset: str, frame: pd.DataFrame) -> str | None:
         table = self._table(dataset)
 
+        # A column that is null in every row of this batch has no detectable
+        # type, so Spark types it VOID and Delta refuses to store it. This is
+        # not hypothetical: `datasets.is_refreshable` is None for every row a
+        # service principal reads, and `job_runs.failure_reason` is null
+        # whenever nothing failed. Dropping the column is the honest option —
+        # it carries no information — and mergeSchema adds it back with its
+        # real type on the first batch that has a value.
+        frame, dropped = _drop_all_null_columns(frame)
+
+        if dropped:
+            print(f"{table}: all-null columns omitted from this batch: {dropped}")
+
         self.spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
         sdf = self.spark.createDataFrame(frame)
 
@@ -115,6 +127,21 @@ class LakehouseDelta:
             # Table not created yet. An empty frame is the honest answer and
             # matches the local backend's behaviour for a missing dataset.
             return pd.DataFrame()
+
+
+def _drop_all_null_columns(frame: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """Return the frame without its entirely-null columns, and their names.
+
+    Kept separate from the backend so it can be tested on its own, and so the
+    rule is stated in one place: a column is dropped only when every row in
+    this batch is null. One real value anywhere keeps it.
+    """
+    dropped = [name for name in frame.columns if frame[name].isna().all()]
+
+    if not dropped:
+        return frame, []
+
+    return frame.drop(columns=dropped), dropped
 
 
 _backend: Backend = LocalParquet()

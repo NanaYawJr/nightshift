@@ -1,4 +1,9 @@
-"""Auth tests that need no network and no real credentials."""
+"""Auth tests that need no network and no real credentials.
+
+The fixture supplies dummy credentials on purpose. Without them these tests
+pass on a machine that has a filled .env and fail on a fresh clone — the suite
+would be testing the developer's environment rather than the code.
+"""
 
 import time
 
@@ -20,9 +25,15 @@ class FakeApp:
 
 @pytest.fixture(autouse=True)
 def clean_cache(monkeypatch):
-    """Each test starts with an empty cache, and outside Fabric."""
+    """Each test starts with an empty cache, outside Fabric, with credentials."""
     auth._cache.clear()
     monkeypatch.setattr(auth, "in_fabric", lambda: False)
+
+    # Dummy, never sent anywhere — the MSAL client is always faked below.
+    monkeypatch.setattr(settings, "fabric_tenant_id", "tenant-test")
+    monkeypatch.setattr(settings, "fabric_client_id", "client-test")
+    monkeypatch.setattr(settings, "fabric_client_secret", "secret-test")
+
     yield
     auth._cache.clear()
 
@@ -87,6 +98,19 @@ def test_missing_msal_outside_fabric_is_a_clear_error(monkeypatch):
         auth.get_token()
 
 
+def test_blank_credentials_outside_fabric_name_themselves(monkeypatch):
+    """Credentials are optional in config because Fabric does not need them.
+    Locally, a blank one produces an authentication error that says nothing, so
+    the check happens here instead and names what is missing."""
+    monkeypatch.setattr(
+        auth, "msal", type("M", (), {"ConfidentialClientApplication": FakeApp})
+    )
+    monkeypatch.setattr(settings, "fabric_client_secret", "")
+
+    with pytest.raises(RuntimeError, match="FABRIC_CLIENT_SECRET"):
+        auth.get_token()
+
+
 # --- Fabric path -----------------------------------------------------------
 
 
@@ -121,6 +145,20 @@ def test_in_fabric_never_touches_msal(monkeypatch):
     monkeypatch.setitem(__import__("sys").modules, "notebookutils", fake_notebookutils)
     monkeypatch.setattr(auth, "in_fabric", lambda: True)
     monkeypatch.setattr(auth, "msal", None)
+
+    assert auth.get_token() == "fabric-token-pbi"
+
+
+def test_in_fabric_needs_no_credentials(monkeypatch):
+    """The point of D-029: nothing to fill in, nothing to rotate."""
+    log: list[str] = []
+
+    fake_notebookutils = type("N", (), {"credentials": FakeCredentials(log)})
+    monkeypatch.setitem(__import__("sys").modules, "notebookutils", fake_notebookutils)
+    monkeypatch.setattr(auth, "in_fabric", lambda: True)
+    monkeypatch.setattr(settings, "fabric_tenant_id", "")
+    monkeypatch.setattr(settings, "fabric_client_id", "")
+    monkeypatch.setattr(settings, "fabric_client_secret", "")
 
     assert auth.get_token() == "fabric-token-pbi"
 

@@ -79,9 +79,13 @@ class FakeSpark:
         self.log: list[tuple] = []
         self.conf = FakeConf(self.log)
         self._tables = tables or {}
+        # The frame as handed to Spark, after the backend has adjusted it.
+        # Kept so a test can assert on columns, not just row counts.
+        self.last_frame: pd.DataFrame | None = None
 
     def createDataFrame(self, pdf):
-        self.log.append(("createDataFrame", len(pdf)))
+        self.last_frame = pdf
+        self.log.append(("createDataFrame", len(pdf), tuple(pdf.columns)))
         return FakeSparkFrame(self.log)
 
     def table(self, name):
@@ -142,6 +146,14 @@ def test_datasets_do_not_leak_into_each_other():
 
     assert len(storage.read("job_runs")) == 2
     assert len(storage.read("refresh_runs")) == 1
+
+
+def test_local_keeps_all_null_columns():
+    """Only the Delta backend drops them. Parquet stores a null column fine,
+    and the local store is where a schema is inspected by hand."""
+    storage.write("datasets", [{"dataset_id": "d1", "is_refreshable": None}])
+
+    assert "is_refreshable" in storage.read("datasets").columns
 
 
 # --- Backend switching -----------------------------------------------------
@@ -228,3 +240,43 @@ def test_lakehouse_enables_arrow_before_converting():
     storage.write("job_runs", ROWS)
 
     assert ("conf", "spark.sql.execution.arrow.pyspark.enabled", "true") in spark.log
+
+
+def test_lakehouse_drops_a_column_that_is_null_in_every_row():
+    """Spark types such a column VOID and Delta refuses to store it. The real
+    case is datasets.is_refreshable, which is None for a service principal."""
+    spark = FakeSpark()
+    storage.use_lakehouse(spark)
+
+    storage.write("datasets", [{"dataset_id": "d1", "is_refreshable": None}])
+
+    assert "dataset_id" in spark.last_frame.columns
+    assert "is_refreshable" not in spark.last_frame.columns
+
+
+def test_lakehouse_keeps_a_column_with_one_real_value():
+    """The rule is all-null, not any-null. A partly-populated column types
+    correctly and its nulls are meaningful evidence."""
+    spark = FakeSpark()
+    storage.use_lakehouse(spark)
+
+    storage.write(
+        "delta_commits",
+        [{"version": 1, "rows_added": None}, {"version": 2, "rows_added": 500}],
+    )
+
+    assert "rows_added" in spark.last_frame.columns
+
+
+def test_dropping_does_not_lose_rows():
+    """A dropped column must not take its rows with it."""
+    spark = FakeSpark()
+    storage.use_lakehouse(spark)
+
+    storage.write(
+        "datasets",
+        [{"dataset_id": "d1", "is_refreshable": None},
+         {"dataset_id": "d2", "is_refreshable": None}],
+    )
+
+    assert len(spark.last_frame) == 2

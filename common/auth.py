@@ -69,6 +69,25 @@ def _msal_token(scope: str) -> dict:
             "Install it, or run where notebookutils is available."
         )
 
+    # Credentials are optional in config because Fabric does not need them.
+    # Reaching here without them means a local run with an unfilled .env, and
+    # a blank credential produces an authentication error that says nothing.
+    missing = [
+        name
+        for name, value in (
+            ("FABRIC_TENANT_ID", settings.fabric_tenant_id),
+            ("FABRIC_CLIENT_ID", settings.fabric_client_id),
+            ("FABRIC_CLIENT_SECRET", settings.fabric_client_secret),
+        )
+        if not value
+    ]
+
+    if missing:
+        raise RuntimeError(
+            f"Missing credentials: {', '.join(missing)}. "
+            "Copy .env.example to .env and fill them in."
+        )
+
     app = msal.ConfidentialClientApplication(
         client_id=settings.fabric_client_id,
         client_credential=settings.fabric_client_secret,
