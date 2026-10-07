@@ -1,32 +1,48 @@
-"""Collect the Delta transaction log for every table in a Lakehouse.
+"""Collect the Delta transaction log, with the rows each commit actually added.
 
 Runs in a Fabric notebook, not locally — `DESCRIBE HISTORY` needs Spark:
 
     import delta_commits
-    delta_commits.collect(spark, ["ledger", "ledger_daily", "repayments"])
+    rows = delta_commits.collect(spark, ["ledger", "ledger_daily"])
 
 Produces the `delta_commits` dataset: one row per commit, with the table, the
-version, and when it happened. That is the second half of the silent_zero_row
-join — pipeline runs say something ran, commits say something was written, and
-the fault lives in the gap between them.
+version, when it happened, and how many rows it added.
 
-Row counts per version are deliberately not collected here. Counting rows at a
-version means reading the data, which on a two-million-row table costs far more
-than reading the log. The rule only needs to know whether a commit happened;
-how many rows it carried is a question for the agent, once there is a reason to
-ask.
+`rows_added` is computed rather than read. `operationMetrics.numOutputRows` is
+populated by Spark but never by Data Factory (D-024), so the only reliable
+count is the difference between the row count at a version and at the version
+before it. Delta time travel makes that possible; it is not cheap, which is why
+it happens here, once per commit, rather than inside a detection rule that runs
+hourly.
+
+Counting is bounded to the most recent `max_counted` versions. A table with
+hundreds of versions would otherwise be scanned hundreds of times, and old
+commits are not what detection is looking at.
+
+This replaced a version that recorded only commit timestamps. The rule built on
+it assumed an empty copy writes no commit at all. It does: twenty-three
+consecutive pipeline runs against a header-only file each produced a Delta
+commit, every one of them adding zero rows. A rule checking only that a commit
+existed reported a healthy estate for twenty-three hours while nothing was
+delivered. See D-026.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 LAG_MINUTES = 10
+MAX_COUNTED_VERSIONS = 60
 
 
-def collect(spark: Any, tables: Iterable[str], workspace: str = "") -> list[dict]:
-    """Read DESCRIBE HISTORY for each table and return one row per commit.
+def collect(
+    spark: Any,
+    tables: Iterable[str],
+    workspace: str = "",
+    max_counted: int = MAX_COUNTED_VERSIONS,
+) -> list[dict]:
+    """Read the transaction log for each table, with row deltas.
 
     A table that does not exist is skipped rather than raising. An estate loses
     and gains tables, and a collector that stops at the first missing one stops
@@ -34,39 +50,105 @@ def collect(spark: Any, tables: Iterable[str], workspace: str = "") -> list[dict
     """
     rows: list[dict] = []
     collected_at = datetime.now(timezone.utc)
+    tables = list(tables)
 
     for table in tables:
         try:
             history = spark.sql(f"DESCRIBE HISTORY {table}").collect()
-        except Exception as exc:  # table missing, or no history
+        except Exception as exc:
             print(f"skipped {table}: {type(exc).__name__}")
             continue
 
+        added = _rows_added_by_version(spark, table, history, max_counted)
+
         for entry in history:
+            version = entry["version"]
             rows.append(
                 {
                     "workspace_name": workspace,
                     "table_name": table,
-                    "version": entry["version"],
+                    "version": version,
                     "timestamp": entry["timestamp"],
                     "operation": entry["operation"],
-                    # Kept despite being NULL for Data Factory writes (D-024).
-                    # If a future writer populates it, the data is already here.
-                    "num_output_rows": _rows_written(entry),
+                    # None where not counted (too old) or not countable.
+                    "rows_added": added.get(version),
+                    # Kept for comparison. NULL for every Data Factory write.
+                    "metrics_rows": _metrics_rows(entry),
                     "collected_at": collected_at,
                 }
             )
 
-    print(f"{len(rows)} commits across {len(list(tables))} tables")
+    print(f"{len(rows)} commits across {len(tables)} tables")
     return rows
 
 
-def _rows_written(entry: Any) -> int | None:
-    """Pull numOutputRows from operationMetrics if the writer recorded it.
+def _rows_added_by_version(
+    spark: Any, table: str, history: list, max_counted: int
+) -> dict[int, int | None]:
+    """How many rows each recent commit added.
 
-    Spark populates this. Data Factory does not — twenty-one consecutive
-    pipeline commits returned NULL (D-024). Hence the rule joins on the
-    existence of a commit rather than on this value.
+    Counts the table at each version and takes consecutive differences. One
+    extra version below the window is counted as a baseline, so the oldest
+    version in the window gets a real delta rather than None.
+    """
+    versions = sorted(entry["version"] for entry in history)
+
+    if not versions:
+        return {}
+
+    # Include one extra below the window to serve as the baseline.
+    start = max(0, len(versions) - max_counted - 1)
+    window = versions[start:]
+
+    counts: dict[int, int | None] = {}
+    for version in window:
+        counts[version] = _count_at(spark, table, version)
+
+    added: dict[int, int | None] = {}
+    for position, version in enumerate(window):
+        current = counts[version]
+
+        if current is None:
+            added[version] = None
+            continue
+
+        if version == 0:
+            added[version] = current
+            continue
+
+        if position == 0:
+            # Baseline itself: no earlier count, so no delta.
+            continue
+
+        previous = counts[window[position - 1]]
+        added[version] = None if previous is None else current - previous
+
+    return added
+
+
+def _count_at(spark: Any, table: str, version: int) -> int | None:
+    """Row count at a specific version, or None if unreadable.
+
+    A version whose files have been vacuumed cannot be read. That is a gap in
+    the record, not an error — returning None lets detection treat it as
+    unknown rather than as zero, which would be a false positive.
+    """
+    try:
+        return (
+            spark.read.format("delta")
+            .option("versionAsOf", version)
+            .table(table)
+            .count()
+        )
+    except Exception:
+        return None
+
+
+def _metrics_rows(entry: Any) -> int | None:
+    """numOutputRows from operationMetrics, where the writer recorded it.
+
+    Spark populates this; Data Factory does not. Retained only so the gap stays
+    visible in the data rather than becoming folklore.
     """
     metrics = entry["operationMetrics"]
 
@@ -84,12 +166,7 @@ def complete_until(rows: list[dict]) -> datetime:
     most recent pipeline runs will have no commit recorded yet — not because
     none happened, but because nobody has looked. Judging those runs would
     produce a false positive on every latest run, every time.
-
-    A margin is subtracted from the collection time because a commit written
-    moments before collection may not yet be visible in the log.
     """
-    from datetime import timedelta
-
     if not rows:
         return datetime.now(timezone.utc) - timedelta(minutes=LAG_MINUTES)
 

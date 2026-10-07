@@ -3,17 +3,22 @@
 The first rule, and the one that defines the pattern the others follow: the
 signal is an **absence** where something was expected, not a value that moved.
 
-Verified behaviour this rule is built on (D-025):
+Verified behaviour this rule is built on:
 
 - A copy activity reading a header-only file completes successfully, in its
-  normal time, with no error anywhere.
-- Delta writes no version at all when there is nothing to write, so the
-  transaction log is silent too.
-- `operationMetrics` is never populated by Data Factory (D-024), so
-  `numOutputRows` is not available even when a commit does happen.
+  normal time, with no error anywhere. Twenty-three consecutive runs took 19 to
+  23 seconds each, matching the healthy baseline exactly.
+- Each of those runs still wrote a Delta commit. An empty copy commits.
+- Every one of those commits added zero rows: the table held 355,000 rows
+  before and after.
+- `operationMetrics` is never populated by Data Factory (D-024), so the commit
+  cannot be asked how much it carried; the count has to be derived from the
+  data and is computed at collection time.
 
-Each telemetry source is individually blind. The fault is only visible in the
-correlation: a successful run with no corresponding commit.
+An earlier version of this rule checked only whether a commit existed in the
+run's window. It reported a healthy estate for twenty-three hours while nothing
+was delivered. The lesson is in D-026: a commit is proof that a write happened,
+not proof that anything was written.
 
 Expectations have to be declared. Telemetry cannot say that
 `pl_ingest_ledger_daily` is supposed to write to `ledger_daily` — only that it
@@ -46,11 +51,17 @@ class WriteExpectation:
     Required because no telemetry source records intent. A pipeline that ran and
     wrote nothing is indistinguishable from a pipeline that was never supposed
     to write anything, unless somebody says which it is.
+
+    `minimum_rows` is how few rows counts as a failure. The default of 1 catches
+    a delivery of nothing. Setting it higher catches a partial delivery — a feed
+    that normally brings 5,000 rows and brings 12 is broken too, and looks just
+    as healthy from the outside.
     """
 
     pipeline: str
     table: str
     workspace: str
+    minimum_rows: int = 1
 
 
 def detect(
@@ -60,20 +71,20 @@ def detect(
     evaluate_before: datetime,
     skew: timedelta = DEFAULT_SKEW,
 ) -> list[Incident]:
-    """Find successful pipeline runs with no matching Delta commit.
+    """Find successful pipeline runs that delivered too few rows, or none.
 
     `runs` comes from collectors.rest_jobs: item_name, status, start_time,
-    end_time, run_id, workspace_name.
+    end_time, run_id, duration_seconds.
 
     `commits` comes from collectors.delta_commits: table_name, version,
-    timestamp, workspace_name.
+    timestamp, rows_added.
 
     `evaluate_before` guards against the collection lag. The Delta collector
     runs on its own schedule, so the most recent pipeline runs will often have
     no commit recorded yet — not because none happened, but because nobody has
     looked. Evaluating those would produce a false positive on every latest run,
     every time. Callers pass the point up to which commit data is known
-    complete, normally the last delta_commits collection time.
+    complete, normally `delta_commits.complete_until()`.
     """
     if runs.empty:
         return []
@@ -85,10 +96,18 @@ def detect(
         table_commits = _commits_for(commits, expectation)
 
         for run in candidates.itertuples():
-            if _has_commit_in_window(table_commits, run.start_time, run.end_time, skew):
+            delivered = _rows_delivered(table_commits, run.start_time, run.end_time, skew)
+
+            # None means the commits in this window were not countable — a
+            # vacuumed version, or outside the counting window. Unknown is not
+            # the same as zero, and guessing produces false positives.
+            if delivered is None:
                 continue
 
-            incidents.append(_build_incident(run, expectation, table_commits))
+            if delivered >= expectation.minimum_rows:
+                continue
+
+            incidents.append(_build_incident(run, expectation, delivered, table_commits))
 
     return incidents
 
@@ -118,24 +137,47 @@ def _commits_for(commits: pd.DataFrame, expectation: WriteExpectation) -> pd.Dat
     return commits[commits["table_name"] == expectation.table]
 
 
-def _has_commit_in_window(
+def _rows_delivered(
     commits: pd.DataFrame, start: datetime, end: datetime, skew: timedelta
-) -> bool:
-    if commits.empty:
-        return False
+) -> int | None:
+    """Rows written to the table during this run.
 
-    within = (commits["timestamp"] >= start - skew) & (
-        commits["timestamp"] <= end + skew
-    )
-    return bool(within.any())
+    Zero when no commit landed in the window — nothing was written, which is
+    the same outcome as a commit that carried nothing. None when a commit
+    landed but its row count is unknown, which must not be read as zero.
+    """
+    if commits.empty:
+        return 0
+
+    in_window = commits[
+        (commits["timestamp"] >= start - skew) & (commits["timestamp"] <= end + skew)
+    ]
+
+    if in_window.empty:
+        return 0
+
+    if in_window["rows_added"].isna().any():
+        return None
+
+    return int(in_window["rows_added"].sum())
 
 
 def _build_incident(
-    run, expectation: WriteExpectation, table_commits: pd.DataFrame
+    run, expectation: WriteExpectation, delivered: int, table_commits: pd.DataFrame
 ) -> Incident:
-    last_commit = (
-        table_commits["timestamp"].max() if not table_commits.empty else None
-    )
+    last_commit = table_commits["timestamp"].max() if not table_commits.empty else None
+
+    if delivered == 0:
+        summary = (
+            f"Run completed in {run.duration_seconds:.0f}s but wrote no rows to "
+            f"{expectation.table}. Downstream data is unchanged and therefore stale."
+        )
+    else:
+        summary = (
+            f"Run completed in {run.duration_seconds:.0f}s and wrote only "
+            f"{delivered:,} rows to {expectation.table}, below the expected "
+            f"{expectation.minimum_rows:,}. Delivery is partial."
+        )
 
     return Incident(
         rule=RULE,
@@ -144,10 +186,7 @@ def _build_incident(
         item_name=expectation.pipeline,
         item_type="DataPipeline",
         severity="high",
-        summary=(
-            f"Run completed in {run.duration_seconds:.0f}s but wrote nothing to "
-            f"{expectation.table}. Downstream data is unchanged and therefore stale."
-        ),
+        summary=summary,
         # The run id. One incident per run, however often detection re-runs.
         occurrence_key=run.run_id,
         measured={
@@ -157,7 +196,8 @@ def _build_incident(
             "run_duration_seconds": round(float(run.duration_seconds), 2),
             "run_status": run.status,
             "expected_table": expectation.table,
-            "commits_in_window": 0,
+            "rows_delivered": delivered,
+            "rows_expected_minimum": expectation.minimum_rows,
             "last_commit_to_table": (
                 last_commit.isoformat() if last_commit is not None else None
             ),
