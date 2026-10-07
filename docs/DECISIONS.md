@@ -993,3 +993,180 @@ cannot be inferred from telemetry.
 **Also noted.** `collectors/rest_jobs` names its timestamp `start_time_utc` while
 `collectors/refresh_history` names the same concept `start_time`. Harmless today,
 a nuisance when rules read both. Worth aligning before the rules are written.
+
+---
+
+## D-026 — An empty copy still commits; detection counts rows, not commits
+
+**Date:** 2026-10-07
+**Status:** Accepted, supersedes D-025
+
+**Context.** D-025 concluded that a pipeline run delivering nothing writes no
+Delta commit at all, and built the detection rule on that: a successful run with
+no commit in its window was the fault.
+
+That conclusion came from a single observation on 2 October — three runs
+completed and `ledger_daily` gained no version. It was wrong, or at least not
+general. With the fault active for twenty-three hours, the table gained
+twenty-three commits, one per run, every one of them adding zero rows:
+
+```
+v122  2026-10-06 17:46  Update   rows_added 0
+v121  2026-10-06 16:46  Update   rows_added 0
+...
+ledger_daily rows at v99:  355,000
+ledger_daily rows at v122: 355,000
+```
+
+Data Factory commits per run regardless of row count. The rule as written
+reported a healthy estate for a full day while nothing was being delivered.
+
+**Decision.** The signal is rows delivered, not commits made.
+`collectors/delta_commits` now computes `rows_added` for each commit by counting
+the table at that version and at the one before, using Delta time travel, and
+the rule compares that against a declared minimum.
+
+Counting happens at collection time, once per commit, because it reads data. It
+is bounded to the most recent versions — a table with hundreds of versions would
+otherwise be scanned hundreds of times.
+
+**Consequences.** The rule now also catches partial delivery. `minimum_rows` on
+the expectation defaults to 1, which catches nothing delivered; set to 4,000 for
+a feed that normally brings 5,000, it catches a run that brings 12. The original
+design could not have seen that at all.
+
+A commit whose row count cannot be determined — a vacuumed version — returns
+None, and the rule skips the run rather than reading unknown as zero. Treating
+unknown as empty would flag healthy runs, which is the failure mode that matters
+most here.
+
+**The general lesson, worth more than the fix.** D-025 drew a design conclusion
+from one observation and three subsequent rules would have inherited it. The
+observation that contradicted it was available the whole time; nobody counted
+rows because the first explanation was satisfying. Before a telemetry property
+becomes a rule, it needs to hold across a run long enough to be boring.
+
+---
+
+## D-027 — The 4 October detection result was a false negative
+
+**Date:** 2026-10-07
+**Status:** Accepted, corrects the record
+
+**Context.** On 4 October the first detection rule was run against three days of
+real telemetry — 74 completed pipeline runs, 75 commits — and reported zero
+incidents. That was recorded as a clean baseline and described as the harder
+half of detection: a rule that stays quiet when nothing is wrong.
+
+It was not. The full commit history shows four silent runs on 2 October,
+versions 21 to 24, between 12:46 and 15:46 — the first injection, which was
+active for four hours before being manually restored. Those runs were inside the
+4 October evaluation window. The rule saw commits, did not count rows, and
+passed them.
+
+Zero incidents was not a clean result. It was four misses, by a rule that could
+not produce a positive at all.
+
+**Decision.** The claim is withdrawn. No detection result counts as a baseline
+unless the estate's state at that moment is independently known — which means
+the sealed fault records, not an assumption that nothing was wrong.
+
+**Consequences.** This is the project's own thesis turned on itself, and it
+belongs in the write-up rather than being quietly corrected. A rule that reports
+health is indistinguishable from a rule that cannot report anything else, and
+the only way to tell them apart is to inject a fault and confirm it fires.
+
+Practically: every rule needs a positive test against a known-active fault
+before any negative result from it is trusted. "Found nothing" is not evidence
+until "found something" has been demonstrated.
+
+**Verified since.** The corrected rule, run against the same estate on
+7 October, found 68 incidents across four distinct silent windows, each
+boundary matching an injection or restore to the hour. Every incident reports a
+run duration of 20 to 30 seconds — identical to the healthy baseline, which is
+why duration was never going to be the signal.
+
+---
+
+## D-028 — Telemetry the collector does not persist is lost silently
+
+**Date:** 2026-10-07
+**Status:** Accepted
+
+**Context.** Investigating why only one of the four silent runs on 2 October
+produced an incident, the commits were all present:
+
+```
+v21  2026-10-02 12:46  rows_added 0
+v22  2026-10-02 13:46  rows_added 0
+v23  2026-10-02 14:46  rows_added 0
+v24  2026-10-02 15:46  rows_added 0
+```
+
+The pipeline runs were not. `job_runs` holds only the 15:46 and 16:46 runs for
+that entire afternoon. The rule behaved correctly — it cannot judge a run it
+cannot see.
+
+The runs were almost certainly lost when `data/job_runs` was deleted during the
+timestamp column rename on 2 October, and were no longer returned by the Fabric
+jobs API by the time collection resumed.
+
+**Decision.** The local store is the system of record, not a cache. Collection
+is append-only and must never be deleted to work around a schema change — a
+migration rewrites the stored data, it does not discard it.
+
+**Consequences.** Three real faults are permanently undetectable. Not because
+the rule missed them, but because the evidence no longer exists.
+
+The failure mode is the same shape as the faults being hunted: history
+disappears, nothing reports an error, and the gap is invisible unless something
+else happens to prove it should have been there. A week-long benchmark would
+lose its earliest evidence and compute accuracy over a shrinking window with no
+indication anything was wrong.
+
+The Delta log saved this investigation precisely because Delta persists its own
+history. Run telemetry has no such property and has to be given one.
+
+**Also implied.** Collection coverage is itself worth monitoring. A detection
+rule over the collectors — "pipeline X has run hourly for weeks and there is a
+four-hour hole in its history" — would have caught this.
+
+---
+
+## D-029 — Detection must run where the telemetry is
+
+**Date:** 2026-10-07
+**Status:** Accepted, not yet implemented
+
+**Context.** Detection currently requires: run the collectors locally, run a
+notebook cell in Fabric, print 150 rows of CSV, copy them out of the browser,
+paste them into a file in the Codespace, update a hardcoded timestamp, and run a
+script.
+
+Today that broke twice. The notebook truncated its output and the paste landed
+48 rows starting mid-file with no header; the second attempt worked only because
+the output happened to fit. The rule itself is sound and fully tested — the
+problem is entirely in getting its two inputs into the same place.
+
+**Decision.** Detection runs where the data is. The options, in order of
+preference:
+
+1. Both collectors write to the Lakehouse incident store, and detection runs in
+   a Fabric notebook on a schedule. The rule is a pure function over DataFrames
+   and does not care whether they came from pandas or Spark, which is why it was
+   built that way.
+2. The Delta collector writes its output somewhere the local process can read
+   directly — the OneLake API, or a shortcut — so the Codespace remains the
+   single place detection runs.
+
+Option 1 matches where the project is going: the agent will run in Fabric,
+reading the incident store. Option 2 keeps the fast local development loop a
+while longer.
+
+**Consequences.** Until this is done, no benchmark can run unattended, because
+every detection cycle needs a human to shuttle a CSV. That alone blocks the
+evaluation harness, which is the project's actual deliverable.
+
+`detect_now.py` stays as scratch and is not part of the system. Its hardcoded
+`EVALUATE_BEFORE` is a symptom of the same problem: the value is printed in one
+place and typed in another.
