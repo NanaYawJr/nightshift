@@ -109,6 +109,17 @@ class LakehouseDelta:
         self.spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
         sdf = self.spark.createDataFrame(frame)
 
+        # The stored table's schema is authoritative; this batch conforms to it.
+        #
+        # Without this, a column's type is decided by whatever happened to be
+        # in the batch. `delta_commits.rows_added` was first written as DOUBLE
+        # because that batch contained nulls, which makes pandas use float64. A
+        # later batch had no nulls at all, came through as BIGINT, and Delta
+        # refused to merge the two — DELTA_FAILED_TO_MERGE_FIELDS, from a
+        # collector whose code had not changed. Any nullable numeric column can
+        # do this, so the fix belongs here rather than in each collector.
+        sdf = self._conform_to_stored_schema(sdf, table)
+
         (
             sdf.write.mode("append")
             .option("mergeSchema", "true")
@@ -117,6 +128,38 @@ class LakehouseDelta:
         )
 
         return table
+
+    def _conform_to_stored_schema(self, sdf: Any, table: str) -> Any:
+        """Cast columns whose type differs from the stored table's.
+
+        Only columns present in both are touched, so a genuinely new column
+        still arrives through mergeSchema with its own inferred type.
+        """
+        stored = self._stored_types(table)
+
+        if not stored:
+            # First write. This batch defines the schema, which is why getting
+            # the first one right matters more than the rest.
+            return sdf
+
+        incoming = {field.name: field.dataType for field in sdf.schema.fields}
+
+        for name, target in casts_needed(incoming, stored).items():
+            # Printed, not silent. A cast is usually widening and harmless —
+            # BIGINT into DOUBLE — but the reverse truncates, and a quiet
+            # truncation in telemetry is the kind of thing that surfaces three
+            # weeks later as an inexplicable benchmark result.
+            print(f"{table}: casting {name} from {incoming[name]} to {target}")
+            sdf = sdf.withColumn(name, sdf[name].cast(target))
+
+        return sdf
+
+    def _stored_types(self, table: str) -> dict[str, Any]:
+        """Column name to Spark type for the existing table, or {} if none."""
+        try:
+            return {f.name: f.dataType for f in self.spark.table(table).schema.fields}
+        except Exception:
+            return {}
 
     def read(self, dataset: str) -> pd.DataFrame:
         table = self._table(dataset)
@@ -127,6 +170,24 @@ class LakehouseDelta:
             # Table not created yet. An empty frame is the honest answer and
             # matches the local backend's behaviour for a missing dataset.
             return pd.DataFrame()
+
+
+def casts_needed(
+    incoming: dict[str, Any], stored: dict[str, Any]
+) -> dict[str, Any]:
+    """Which incoming columns need casting to match the stored table.
+
+    Plain dictionaries in and out so the rule can be tested without Spark. The
+    rule itself is one line of intent: a column that exists in both and whose
+    type differs is cast to the stored type. Everything else is left alone —
+    a new column belongs to mergeSchema, and a column that has gone away
+    simply writes nulls.
+    """
+    return {
+        name: stored[name]
+        for name, kind in incoming.items()
+        if name in stored and stored[name] != kind
+    }
 
 
 def _drop_all_null_columns(frame: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:

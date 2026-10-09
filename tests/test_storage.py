@@ -51,10 +51,51 @@ class FakeWriter:
         self.log.append(("saveAsTable", name))
 
 
+class FakeField:
+    """One column of a fake Spark schema."""
+
+    def __init__(self, name: str, data_type: str):
+        self.name = name
+        self.dataType = data_type
+
+
+class FakeSchema:
+    def __init__(self, types: dict[str, str]):
+        self.fields = [FakeField(name, kind) for name, kind in types.items()]
+
+
+class FakeColumn:
+    """Supports sdf[name].cast(target), recording the cast that was asked for."""
+
+    def __init__(self, log: list, name: str):
+        self.log = log
+        self.name = name
+
+    def cast(self, target):
+        self.log.append(("cast", self.name, target))
+        return self
+
+
 class FakeSparkFrame:
-    def __init__(self, log: list, pdf: pd.DataFrame | None = None):
+    def __init__(
+        self,
+        log: list,
+        pdf: pd.DataFrame | None = None,
+        types: dict[str, str] | None = None,
+    ):
         self.log = log
         self._pdf = pdf if pdf is not None else pd.DataFrame()
+        self._types = types or {}
+
+    @property
+    def schema(self):
+        return FakeSchema(self._types)
+
+    def __getitem__(self, name):
+        return FakeColumn(self.log, name)
+
+    def withColumn(self, name, column):
+        return self
 
     @property
     def write(self):
@@ -73,12 +114,26 @@ class FakeConf:
 
 
 class FakeSpark:
-    """Records what was asked of it. Executes nothing."""
+    """Records what was asked of it. Executes nothing.
 
-    def __init__(self, tables: dict[str, pd.DataFrame] | None = None):
+    `tables` holds what already exists in the Lakehouse, as frames. `types`
+    optionally declares the stored Spark type of each column, which is what
+    the schema-conforming step reads. `incoming_types` declares what a newly
+    created DataFrame looks like, so a batch whose types differ from the
+    stored table can be simulated.
+    """
+
+    def __init__(
+        self,
+        tables: dict[str, pd.DataFrame] | None = None,
+        types: dict[str, dict[str, str]] | None = None,
+        incoming_types: dict[str, str] | None = None,
+    ):
         self.log: list[tuple] = []
         self.conf = FakeConf(self.log)
         self._tables = tables or {}
+        self._types = types or {}
+        self._incoming_types = incoming_types or {}
         # The frame as handed to Spark, after the backend has adjusted it.
         # Kept so a test can assert on columns, not just row counts.
         self.last_frame: pd.DataFrame | None = None
@@ -86,13 +141,18 @@ class FakeSpark:
     def createDataFrame(self, pdf):
         self.last_frame = pdf
         self.log.append(("createDataFrame", len(pdf), tuple(pdf.columns)))
-        return FakeSparkFrame(self.log)
+
+        types = self._incoming_types or {name: "inferred" for name in pdf.columns}
+        return FakeSparkFrame(self.log, types=types)
 
     def table(self, name):
         self.log.append(("table", name))
         if name not in self._tables:
             raise ValueError(f"no such table: {name}")
-        return FakeSparkFrame(self.log, self._tables[name])
+
+        return FakeSparkFrame(
+            self.log, self._tables[name], types=self._types.get(name, {})
+        )
 
 
 # --- Local backend ---------------------------------------------------------
@@ -266,6 +326,73 @@ def test_lakehouse_keeps_a_column_with_one_real_value():
     )
 
     assert "rows_added" in spark.last_frame.columns
+
+
+# --- Conforming to the stored schema --------------------------------------
+
+
+def test_casts_needed_picks_only_columns_that_differ():
+    """The rule, stated as plain dictionaries. A column in both whose type
+    differs is cast; everything else is left alone."""
+    incoming = {"version": "bigint", "rows_added": "bigint", "note": "string"}
+    stored = {"version": "bigint", "rows_added": "double"}
+
+    assert storage.casts_needed(incoming, stored) == {"rows_added": "double"}
+
+
+def test_a_new_column_is_not_cast():
+    """It belongs to mergeSchema, which gives it the type it was inferred as."""
+    assert storage.casts_needed({"brand_new": "string"}, {"version": "bigint"}) == {}
+
+
+def test_nothing_to_do_when_types_already_match():
+    incoming = {"version": "bigint", "rows_added": "double"}
+
+    assert storage.casts_needed(incoming, dict(incoming)) == {}
+
+
+def test_the_batch_is_cast_to_the_stored_type():
+    """The real failure: rows_added stored as DOUBLE because the first batch
+    held nulls, then a batch with no nulls arriving as BIGINT. Delta refused
+    to merge them and the collector died with DELTA_FAILED_TO_MERGE_FIELDS,
+    having changed not at all."""
+    spark = FakeSpark(
+        tables={"tel_delta_commits": pd.DataFrame()},
+        types={"tel_delta_commits": {"version": "bigint", "rows_added": "double"}},
+        incoming_types={"version": "bigint", "rows_added": "bigint"},
+    )
+    storage.use_lakehouse(spark)
+
+    storage.write("delta_commits", [{"version": 1, "rows_added": 5000}])
+
+    assert ("cast", "rows_added", "double") in spark.log
+    assert ("cast", "version", "bigint") not in spark.log
+
+
+def test_the_first_write_defines_the_schema():
+    """No stored table, so nothing to conform to and nothing to cast."""
+    spark = FakeSpark(incoming_types={"rows_added": "bigint"})
+    storage.use_lakehouse(spark)
+
+    storage.write("delta_commits", [{"rows_added": 5000}])
+
+    assert not [entry for entry in spark.log if entry[0] == "cast"]
+    assert ("saveAsTable", "tel_delta_commits") in spark.log
+
+
+def test_a_write_still_happens_when_a_cast_was_needed():
+    """Conforming must not swallow the write itself."""
+    spark = FakeSpark(
+        tables={"tel_delta_commits": pd.DataFrame()},
+        types={"tel_delta_commits": {"rows_added": "double"}},
+        incoming_types={"rows_added": "bigint"},
+    )
+    storage.use_lakehouse(spark)
+
+    storage.write("delta_commits", [{"rows_added": 5000}])
+
+    assert ("mode", "append") in spark.log
+    assert ("saveAsTable", "tel_delta_commits") in spark.log
 
 
 def test_dropping_does_not_lose_rows():
