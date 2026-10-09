@@ -38,8 +38,16 @@ class Settings(BaseSettings):
     telemetry_lakehouse: str = "lh_nightshift"
     estate_lakehouse: str = "lh_finance_bronze"
 
+    # The reasoning layer. Any provider speaking the OpenAI chat-completions
+    # shape works, which is all of the free tiers — so switching provider is
+    # these three values and nothing else in the project.
+    #
+    # Copy model_name verbatim from the provider's own console. Model ids churn
+    # faster than anything else here, and a stale one comes back as a 400 that
+    # lists the valid ones.
     model_api_key: str = ""
     model_name: str = ""
+    model_base_url: str = ""
 
     # Fabric REST. Versioned deliberately — v1 is the documented surface.
     fabric_api_base: str = "https://api.fabric.microsoft.com/v1"
