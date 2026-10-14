@@ -184,6 +184,33 @@ def complete_until(commits: pd.DataFrame) -> datetime:
     return latest.to_pydatetime() - timedelta(minutes=LAG_MINUTES)
 
 
+def last_collected() -> dict[str, datetime | None]:
+    """When each dataset was last written, or None if it never has been.
+
+    What `collection_gap` reads. Taken from the raw store rather than the
+    deduplicated view on purpose: deduplication answers "what is true", and
+    this question is "when did anyone last look", which survives in the raw
+    rows even when every one of them is a repeat of something already known.
+    """
+    seen: dict[str, datetime | None] = {}
+
+    for dataset in NATURAL_KEYS:
+        frame = storage.read(dataset)
+
+        if frame.empty or "collected_at" not in frame.columns:
+            seen[dataset] = None
+            continue
+
+        latest = pd.to_datetime(frame["collected_at"]).max()
+
+        if latest.tzinfo is None:
+            latest = latest.tz_localize("UTC")
+
+        seen[dataset] = latest.to_pydatetime()
+
+    return seen
+
+
 def counts() -> dict[str, tuple[int, int]]:
     """Per dataset: rows stored, rows after deduplication.
 

@@ -249,6 +249,39 @@ def test_counts_covers_every_declared_dataset():
     assert set(telemetry.counts()) == set(telemetry.NATURAL_KEYS)
 
 
+# --- When anyone last looked ----------------------------------------------
+
+
+def test_last_collected_reports_the_newest_write():
+    """What collection_gap reads to decide whether the evidence is current."""
+    storage.write("job_runs", [{"run_id": "r1", "collected_at": EARLIER}])
+    storage.write("job_runs", [{"run_id": "r2", "collected_at": LATER}])
+
+    assert telemetry.last_collected()["job_runs"] == LATER
+
+
+def test_last_collected_is_none_for_a_dataset_never_written():
+    """Distinct from "collected long ago", and the rule treats it differently:
+    an empty table looks exactly like a healthy estate."""
+    assert telemetry.last_collected()["delta_commits"] is None
+
+
+def test_last_collected_sees_rows_deduplication_would_discard():
+    """Read from the raw store, not the deduplicated view. A collection that
+    found nothing new still proves somebody looked, and that is the whole
+    question this answers."""
+    row = {"run_id": "r1", "status": "Completed"}
+    storage.write("job_runs", [{**row, "collected_at": EARLIER}])
+    storage.write("job_runs", [{**row, "collected_at": LATER}])
+
+    assert len(telemetry.load("job_runs")) == 1
+    assert telemetry.last_collected()["job_runs"] == LATER
+
+
+def test_last_collected_covers_every_declared_dataset():
+    assert set(telemetry.last_collected()) == set(telemetry.NATURAL_KEYS)
+
+
 # --- Timezones (D-007) -----------------------------------------------------
 
 
