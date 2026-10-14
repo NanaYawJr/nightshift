@@ -102,10 +102,25 @@ def as_utc(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def deduplicate(frame: pd.DataFrame, keys: tuple[str, ...]) -> pd.DataFrame:
-    """Keep the latest-collected row for each key.
+    """Collapse each key to the latest *known* value of every field.
 
-    Separate from `load` so it can be tested without a storage backend, and so
-    a caller holding a frame from somewhere else can apply the same rule.
+    Not "the latest row". The difference matters and it cost real data.
+
+    `delta_commits.rows_added` is counted only for recent versions, so a later
+    collection returns null for a commit an earlier one measured exactly. Under
+    last-row-wins that null replaced a real figure, and the record got worse by
+    being collected again — 134 measured row counts became unknown in a single
+    run (D-035).
+
+    Field by field, the newest non-null value wins. A run collected as
+    InProgress and later as Completed still resolves to Completed, because
+    Completed is the newest non-null status. A measurement that stops being
+    reported keeps the last value anyone actually observed, which for immutable
+    telemetry — a commit's row count never changes — is the only honest answer.
+
+    The cost: a field that legitimately becomes null keeps its old value.
+    Nothing in this project's telemetry does that, and the alternative has
+    already destroyed data once.
     """
     missing = [key for key in keys if key not in frame.columns]
 
@@ -121,15 +136,26 @@ def deduplicate(frame: pd.DataFrame, keys: tuple[str, ...]) -> pd.DataFrame:
         # claimed honestly.
         return frame.drop_duplicates(subset=list(keys), keep="last")
 
-    # sort_values is stable, so rows collected in the same batch keep their
-    # original order and `keep="last"` takes the final one deterministically.
+    # Stable sort, so rows collected in the same batch keep their original
+    # order and "newest" is deterministic.
     ordered = frame.sort_values("collected_at", kind="stable")
+    others = [name for name in ordered.columns if name not in keys]
+
+    if not others:
+        return ordered.drop_duplicates(subset=list(keys)).reset_index(drop=True)
 
     return (
-        ordered.drop_duplicates(subset=list(keys), keep="last")
-        .sort_index()
-        .reset_index(drop=True)
+        ordered.groupby(list(keys), sort=False, dropna=False)[others]
+        .agg(_latest_known)
+        .reset_index()
     )
+
+
+def _latest_known(values: pd.Series):
+    """The last non-null value in a group, or null when there were none."""
+    known = values.dropna()
+
+    return known.iloc[-1] if len(known) else None
 
 
 def complete_until(commits: pd.DataFrame) -> datetime:

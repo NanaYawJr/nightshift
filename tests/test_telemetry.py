@@ -77,6 +77,80 @@ def test_distinct_rows_are_all_kept():
     assert len(telemetry.load("job_runs")) == 3
 
 
+# --- A null must not erase a measurement (D-035) --------------------------
+
+
+def test_a_later_null_does_not_erase_a_measured_value():
+    """The one that cost data. rows_added is counted only for recent versions,
+    so a later collection reports null for a commit an earlier one measured
+    exactly. Last-row-wins turned 134 real figures into unknowns."""
+    frame = pd.DataFrame(
+        [
+            {"version": 7, "rows_added": 5000.0, "collected_at": EARLIER},
+            {"version": 7, "rows_added": None, "collected_at": LATER},
+        ]
+    )
+
+    result = telemetry.deduplicate(frame, ("version",))
+
+    assert result.iloc[0]["rows_added"] == 5000.0
+
+
+def test_a_later_value_still_replaces_an_earlier_one():
+    """Newest non-null wins. This is not "first wins" in disguise."""
+    frame = pd.DataFrame(
+        [
+            {"version": 7, "rows_added": 10.0, "collected_at": EARLIER},
+            {"version": 7, "rows_added": 5000.0, "collected_at": LATER},
+        ]
+    )
+
+    assert telemetry.deduplicate(frame, ("version",)).iloc[0]["rows_added"] == 5000.0
+
+
+def test_a_later_value_fills_a_gap_an_earlier_collection_left():
+    """Unknown then measured. Both directions have to work, or the rule is
+    just a preference for whichever collection happened to run first."""
+    frame = pd.DataFrame(
+        [
+            {"version": 7, "rows_added": None, "collected_at": EARLIER},
+            {"version": 7, "rows_added": 5000.0, "collected_at": LATER},
+        ]
+    )
+
+    assert telemetry.deduplicate(frame, ("version",)).iloc[0]["rows_added"] == 5000.0
+
+
+def test_never_measured_stays_unknown():
+    """Nulls all the way down must not acquire a number from somewhere."""
+    frame = pd.DataFrame(
+        [
+            {"version": 7, "rows_added": None, "collected_at": EARLIER},
+            {"version": 7, "rows_added": None, "collected_at": LATER},
+        ]
+    )
+
+    assert pd.isna(telemetry.deduplicate(frame, ("version",)).iloc[0]["rows_added"])
+
+
+def test_fields_resolve_independently_of_each_other():
+    """Each column takes its own newest known value, so one field going quiet
+    does not drag the others back to an older observation."""
+    frame = pd.DataFrame(
+        [
+            {"run_id": "r1", "status": "InProgress", "duration_seconds": None,
+             "collected_at": EARLIER},
+            {"run_id": "r1", "status": "Completed", "duration_seconds": 22.0,
+             "collected_at": LATER},
+        ]
+    )
+
+    result = telemetry.deduplicate(frame, ("run_id",))
+
+    assert result.iloc[0]["status"] == "Completed"
+    assert result.iloc[0]["duration_seconds"] == 22.0
+
+
 # --- Composite keys --------------------------------------------------------
 
 
