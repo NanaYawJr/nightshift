@@ -177,7 +177,14 @@ def test_no_business_data_reaches_the_pack():
     pack = evidence.build(an_incident(), some_runs(), some_commits(), now=NOW)
 
     for key in pack.keys():
-        assert key.split(".")[0] in {"run", "pipeline", "table", "expectation", "estate"}
+        assert key.split(".")[0] in {
+            "run",
+            "pipeline",
+            "table",
+            "expectation",
+            "estate",
+            "source",
+        }
 
 
 # --- The citation check ----------------------------------------------------
@@ -378,3 +385,113 @@ def test_the_fallback_works_on_a_pack_with_almost_nothing_in_it():
 
     assert result.source == "fallback"
     validate(result, pack.keys())
+
+
+# --- Source facts (the gap the agent found itself) ------------------------
+
+
+def some_landing() -> pd.DataFrame:
+    """Three samples of the landing file: healthy, healthy, then empty."""
+    return pd.DataFrame(
+        [
+            {
+                "source_name": "ledger_daily_landing",
+                "exists": True,
+                "size_bytes": 412_000,
+                "data_rows": 5000,
+                "modified_at": RUN_START - timedelta(hours=2),
+                "collected_at": RUN_START - timedelta(hours=2),
+            },
+            {
+                "source_name": "ledger_daily_landing",
+                "exists": True,
+                "size_bytes": 412_000,
+                "data_rows": 5000,
+                "modified_at": RUN_START - timedelta(hours=1),
+                "collected_at": RUN_START - timedelta(hours=1),
+            },
+            {
+                "source_name": "ledger_daily_landing",
+                "exists": True,
+                "size_bytes": 312,
+                "data_rows": 0,
+                "modified_at": RUN_START - timedelta(minutes=6),
+                "collected_at": RUN_START - timedelta(minutes=5),
+            },
+        ]
+    )
+
+
+def test_the_pack_states_what_the_source_held():
+    """The fact that makes a cause reachable rather than a symptom."""
+    pack = evidence.build(
+        an_incident(), some_runs(), some_commits(), some_landing(), now=NOW
+    )
+
+    assert pack.facts["source.data_rows"].value == 0
+    assert pack.facts["source.size_bytes"].value == 312
+    assert pack.facts["source.exists"].value is True
+
+
+def test_the_snapshot_chosen_is_the_last_one_before_the_run_ended():
+    """A later sample describes a file that may have been replaced since,
+    which is the difference between evidence and a guess."""
+    pack = evidence.build(
+        an_incident(), some_runs(), some_commits(), some_landing(), now=NOW
+    )
+
+    assert pack.facts["source.snapshots_observed"].value == 3
+    assert pack.facts["source.data_rows"].value == 0
+
+
+def test_a_later_snapshot_is_not_used():
+    """Sampled after the run ended, so it says nothing about what the run
+    was given."""
+    landing = some_landing()
+    landing.loc[2, "collected_at"] = RUN_END + timedelta(hours=1)
+    landing.loc[2, "data_rows"] = 0
+
+    pack = evidence.build(
+        an_incident(), some_runs(), some_commits(), landing, now=NOW
+    )
+
+    assert pack.facts["source.data_rows"].value == 5000
+
+
+def test_the_pack_says_how_stale_the_source_was():
+    pack = evidence.build(
+        an_incident(), some_runs(), some_commits(), some_landing(), now=NOW
+    )
+
+    assert pack.facts["source.hours_old_at_run"].value == pytest.approx(0.1, abs=0.05)
+
+
+def test_an_incident_from_before_the_sampler_says_so():
+    """Honest absence. The file was not measured then, and saying nothing at
+    all would let a reader assume the source was fine."""
+    pack = evidence.build(an_incident(), some_runs(), some_commits(), now=NOW)
+
+    assert pack.facts["source.snapshots_observed"].value == 0
+    assert "source.data_rows" not in pack.keys()
+
+
+def test_the_source_path_never_reaches_the_pack():
+    """Size, rows and a timestamp are platform telemetry. A path is an
+    address inside the customer's estate and the model does not need it."""
+    pack = evidence.build(
+        an_incident(), some_runs(), some_commits(), some_landing(), now=NOW
+    )
+
+    assert "source.path" not in pack.keys()
+    assert "abfss" not in pack.as_prompt()
+
+
+def test_source_values_render_as_plain_numbers():
+    """A numpy scalar prints as np.int64(0) in a prompt, which is noise the
+    model has to parse around and a citation it may copy wrongly."""
+    pack = evidence.build(
+        an_incident(), some_runs(), some_commits(), some_landing(), now=NOW
+    )
+
+    assert "np.int" not in pack.as_prompt()
+    assert "source.data_rows = 0" in pack.as_prompt()

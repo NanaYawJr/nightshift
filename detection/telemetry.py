@@ -41,6 +41,10 @@ NATURAL_KEYS: dict[str, tuple[str, ...]] = {
     # refresh_id restarts per dataset, so on its own it collides.
     "refresh_runs": ("dataset_id", "refresh_id"),
     "delta_commits": ("workspace_name", "table_name", "version"),
+    # A sampler, not a backfill. Each collection is a fresh observation of a
+    # file that changes, so the moment is part of the identity — two snapshots
+    # of one file at different times are two facts, not a duplicate.
+    "landing_files": ("source_name", "collected_at"),
 }
 
 

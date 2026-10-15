@@ -82,13 +82,19 @@ def build(
     incident: Incident,
     runs: pd.DataFrame,
     commits: pd.DataFrame,
+    landing: pd.DataFrame | None = None,
     now: datetime | None = None,
 ) -> EvidencePack:
     """Assemble the evidence pack for one incident.
 
-    `runs` and `commits` must come from `detection.telemetry.load`, which
-    deduplicates and makes timestamps UTC-aware. Passing raw storage output
-    here would double-count and then raise on the first comparison.
+    `runs`, `commits` and `landing` must come from `detection.telemetry.load`,
+    which deduplicates and makes timestamps UTC-aware. Passing raw storage
+    output here would double-count and then raise on the first comparison.
+
+    `landing` is optional because the sampler did not exist for the first two
+    weeks of collection. An incident from before it started gets a pack with
+    no source facts, which is honest — the file was not measured then, and
+    saying nothing is better than implying it was.
     """
     now = now or datetime.now(timezone.utc)
     pack = EvidencePack(incident_id=incident.incident_id)
@@ -99,6 +105,7 @@ def build(
     _add_incident_facts(pack, incident)
     _add_pipeline_baseline(pack, runs, pipeline)
     _add_table_baseline(pack, commits, table, now)
+    _add_source_facts(pack, landing, incident)
     _add_concurrency(pack, runs, incident, pipeline)
 
     return pack
@@ -272,6 +279,101 @@ def _last_delivery(commits: pd.DataFrame, rows: pd.Series) -> datetime | None:
         return None
 
     return pd.to_datetime(productive["timestamp"]).max().to_pydatetime()
+
+
+def _add_source_facts(
+    pack: EvidencePack, landing: pd.DataFrame | None, incident: Incident
+) -> None:
+    """What the pipeline was given to copy, as it stood around the run.
+
+    The facts that make a cause reachable instead of a symptom. Every
+    diagnosis in the first agent run said "check the source", correctly,
+    because nothing in the pack described the source at all.
+
+    The snapshot chosen is the most recent one taken at or before the run
+    ended. A later snapshot would describe a file that may have been replaced
+    since, which is the difference between evidence and a guess.
+    """
+    if landing is None or landing.empty:
+        pack.add(
+            "source.snapshots_observed",
+            0,
+            "samples of the pipeline's source file around this run",
+        )
+        return
+
+    ended = incident.measured.get("run_ended")
+
+    if not ended:
+        return
+
+    at_or_before = landing[pd.to_datetime(landing["collected_at"]) <= pd.Timestamp(ended)]
+
+    pack.add(
+        "source.snapshots_observed",
+        len(at_or_before),
+        "samples of the pipeline's source file taken at or before this run",
+    )
+
+    if at_or_before.empty:
+        # The sampler started after this incident. Saying so is a fact; saying
+        # nothing would leave a reader assuming the source was fine.
+        return
+
+    snapshot = at_or_before.loc[pd.to_datetime(at_or_before["collected_at"]).idxmax()]
+
+    pack.add("source.name", snapshot.get("source_name"), "the file the pipeline reads")
+    pack.add(
+        "source.sampled_at",
+        _iso(snapshot.get("collected_at")),
+        "when the source was last sampled before this run ended",
+    )
+    pack.add(
+        "source.exists",
+        bool(snapshot.get("exists")),
+        "whether the source file was present at that moment",
+    )
+    pack.add(
+        "source.data_rows",
+        _plain(snapshot.get("data_rows")),
+        "rows in the source file, excluding the header",
+    )
+    pack.add(
+        "source.size_bytes",
+        _plain(snapshot.get("size_bytes")),
+        "size of the source file in bytes",
+    )
+    pack.add(
+        "source.modified_at",
+        _iso(snapshot.get("modified_at")),
+        "when the source file was last written",
+    )
+
+    started = incident.measured.get("run_started")
+    modified = snapshot.get("modified_at")
+
+    if started and pd.notna(modified):
+        age = (pd.Timestamp(started) - pd.Timestamp(modified)).total_seconds() / 3600
+        pack.add(
+            "source.hours_old_at_run",
+            round(age, 1),
+            "how long before the run the source was last written",
+        )
+
+
+def _iso(value) -> str | None:
+    if value is None or pd.isna(value):
+        return None
+
+    return pd.Timestamp(value).isoformat()
+
+
+def _plain(value):
+    """Numpy scalars render as `np.int64(0)` in a prompt. Plain ones do not."""
+    if value is None or pd.isna(value):
+        return None
+
+    return value.item() if hasattr(value, "item") else value
 
 
 def _add_concurrency(
