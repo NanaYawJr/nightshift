@@ -600,3 +600,50 @@ def test_every_implemented_fault_declares_its_class():
     for name, cls in IMPLEMENTED.items():
         assert cls.fault_class == name
         assert cls.fault_class != Fault.fault_class
+
+# --- The backup is protected like the seal is (D-037) ---------------------
+
+
+def test_a_second_injection_refuses_to_overwrite_the_backup(landing, tmp_path):
+    """The real incident. Re-running the injection cell copies the already
+    emptied file over the backup and destroys the only copy of the original.
+    The seal refused to overwrite the ground truth; nothing protected the data."""
+    backup_dir = tmp_path / "backup"
+
+    first = SilentZeroRow("ws", "pl", landing_path=str(landing), backup_dir=str(backup_dir))
+    first.inject(FakeSpark())
+
+    second = SilentZeroRow("ws", "pl", landing_path=str(landing), backup_dir=str(backup_dir))
+
+    with pytest.raises(FileExistsError, match="already injected"):
+        second.inject(FakeSpark())
+
+
+def test_the_backup_still_holds_the_original_after_a_refused_injection(landing, tmp_path):
+    """The point of the guard: the data survives the mistake."""
+    backup_dir = tmp_path / "backup"
+    original = landing.read_text()
+
+    first = SilentZeroRow("ws", "pl", landing_path=str(landing), backup_dir=str(backup_dir))
+    first.inject(FakeSpark())
+
+    second = SilentZeroRow("ws", "pl", landing_path=str(landing), backup_dir=str(backup_dir))
+    with pytest.raises(FileExistsError):
+        second.inject(FakeSpark())
+
+    assert (backup_dir / landing.name).read_text() == original
+
+
+def test_a_reverted_fault_can_be_injected_again(landing, tmp_path):
+    """The guard must not make the estate single-use. Revert removes the
+    backup, so the next injection is free to take a fresh one."""
+    backup_dir = tmp_path / "backup"
+
+    first = SilentZeroRow("ws", "pl", landing_path=str(landing), backup_dir=str(backup_dir))
+    first.inject(FakeSpark())
+    first.revert(FakeSpark())
+
+    second = SilentZeroRow("ws", "pl", landing_path=str(landing), backup_dir=str(backup_dir))
+    second.inject(FakeSpark())
+
+    assert landing.read_text().splitlines() == [HEADER]

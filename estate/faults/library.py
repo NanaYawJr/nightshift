@@ -343,6 +343,25 @@ class SilentZeroRow(Fault):
 
         backup = Path(self._backup_path)
         backup.parent.mkdir(parents=True, exist_ok=True)
+
+        # Refuses to overwrite, for the same reason Seal.store does.
+        #
+        # Re-running the injection — "Run all" in a notebook is enough — copies
+        # the already-emptied file over the backup and destroys the only copy
+        # of the original. That happened on 15 October. The seal correctly
+        # refused to overwrite the ground truth; nothing protected the data,
+        # and the estate had to be regenerated rather than restored (D-037).
+        #
+        # The seal protects the record of what was done. This protects the
+        # ability to undo it. Both are needed and only one existed.
+        if backup.exists():
+            raise FileExistsError(
+                f"A backup already exists at {backup}, so this fault looks "
+                "already injected. Overwriting it would destroy the only copy "
+                "of the original landing file. Revert first, or delete the "
+                "backup deliberately if you are certain it is stale."
+            )
+
         shutil.copy2(source, backup)
 
         self._revert_state = {"backup": str(backup), "source": str(source)}
