@@ -184,6 +184,7 @@ def test_no_business_data_reaches_the_pack():
             "expectation",
             "estate",
             "source",
+            "coverage",
         }
 
 
@@ -440,7 +441,7 @@ def test_the_snapshot_chosen_is_the_last_one_before_the_run_ended():
         an_incident(), some_runs(), some_commits(), some_landing(), now=NOW
     )
 
-    assert pack.facts["source.snapshots_observed"].value == 3
+    assert pack.facts["coverage.source_samples"].value == 3
     assert pack.facts["source.data_rows"].value == 0
 
 
@@ -471,7 +472,8 @@ def test_an_incident_from_before_the_sampler_says_so():
     all would let a reader assume the source was fine."""
     pack = evidence.build(an_incident(), some_runs(), some_commits(), now=NOW)
 
-    assert pack.facts["source.snapshots_observed"].value == 0
+    assert pack.facts["coverage.source_measured"].value is False
+    assert pack.facts["coverage.source_samples"].value == 0
     assert "source.data_rows" not in pack.keys()
 
 
@@ -495,3 +497,31 @@ def test_source_values_render_as_plain_numbers():
 
     assert "np.int" not in pack.as_prompt()
     assert "source.data_rows = 0" in pack.as_prompt()
+
+def test_coverage_is_never_in_the_source_namespace():
+    """D-038. A fact about instrumentation sitting among facts about the file
+    is how "the sampler had not been built" became "the source was empty"."""
+    pack = evidence.build(
+        an_incident(), some_runs(), some_commits(), some_landing(), now=NOW
+    )
+
+    # The dangerous shape is a COUNT OF OBSERVATIONS sitting in a namespace
+    # of real properties, because zero then reads as a finding about the thing
+    # rather than about the looking. `source.sampled_at` is fine — a timestamp
+    # qualifying the other source facts. `table.commits_observed` is fine — a
+    # real count of the estate.
+    assert "source.snapshots_observed" not in pack.keys()
+    assert "coverage.source_samples" in pack.keys()
+
+    for key in pack.keys():
+        if key.startswith("source."):
+            assert not key.endswith(("_observed", "_samples")), key
+
+
+def test_a_measured_source_says_so_explicitly():
+    """A boolean the model cannot misread as a quantity."""
+    pack = evidence.build(
+        an_incident(), some_runs(), some_commits(), some_landing(), now=NOW
+    )
+
+    assert pack.facts["coverage.source_measured"].value is True

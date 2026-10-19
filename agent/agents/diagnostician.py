@@ -41,6 +41,11 @@ most likely cause.
 
 Rules:
 - Use only the facts given. You have no other information about this estate.
+- Facts beginning `coverage.` describe what was measured, not what is true of
+  the estate. `coverage.source_measured = False` means nobody sampled the
+  source, not that the source was empty. Never build a cause on a coverage
+  fact; if the evidence you would need was not measured, that is a reason to
+  answer "undetermined".
 - Cite the exact fact keys your explanation depends on.
 - If the facts do not support a conclusion, say so by setting cause to
   "undetermined". An honest abstention is a correct answer; a confident guess

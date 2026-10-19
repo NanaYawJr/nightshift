@@ -295,11 +295,7 @@ def _add_source_facts(
     since, which is the difference between evidence and a guess.
     """
     if landing is None or landing.empty:
-        pack.add(
-            "source.snapshots_observed",
-            0,
-            "samples of the pipeline's source file around this run",
-        )
+        _add_coverage(pack, samples=0)
         return
 
     ended = incident.measured.get("run_ended")
@@ -309,15 +305,11 @@ def _add_source_facts(
 
     at_or_before = landing[pd.to_datetime(landing["collected_at"]) <= pd.Timestamp(ended)]
 
-    pack.add(
-        "source.snapshots_observed",
-        len(at_or_before),
-        "samples of the pipeline's source file taken at or before this run",
-    )
+    _add_coverage(pack, samples=len(at_or_before))
 
     if at_or_before.empty:
-        # The sampler started after this incident. Saying so is a fact; saying
-        # nothing would leave a reader assuming the source was fine.
+        # The sampler started after this incident. The coverage fact says so;
+        # saying nothing would leave a reader assuming the source was fine.
         return
 
     snapshot = at_or_before.loc[pd.to_datetime(at_or_before["collected_at"]).idxmax()]
@@ -374,6 +366,31 @@ def _plain(value):
         return None
 
     return value.item() if hasattr(value, "item") else value
+
+
+def _add_coverage(pack: EvidencePack, samples: int) -> None:
+    """How much was measured, as distinct from what was found.
+
+    These live under `coverage.` and nothing else does, because a model that
+    cannot tell the two apart will build a cause out of a gap in the
+    instrumentation. It did exactly that: `source.snapshots_observed = 0` meant
+    the sampler had not been built yet when that incident happened, and the
+    diagnosis came back as "zero rows were delivered because the source
+    snapshots observed count was zero" (D-038).
+
+    Absence of measurement is not a measurement of absence. The namespace is
+    the cheapest place to make that unmistakable.
+    """
+    pack.add(
+        "coverage.source_measured",
+        samples > 0,
+        "whether the source file was sampled at all around this run",
+    )
+    pack.add(
+        "coverage.source_samples",
+        samples,
+        "how many times the source file was sampled at or before this run",
+    )
 
 
 def _add_concurrency(
