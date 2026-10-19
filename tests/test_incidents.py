@@ -260,6 +260,7 @@ def test_the_summary_counts_what_matters():
     assert counts["incidents"] == 2
     assert counts["diagnosed"] == 1
     assert counts["by_model"] == 1
+    assert counts["abstained"] == 0
     assert counts["pending"] == 1
 
 

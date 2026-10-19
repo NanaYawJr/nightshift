@@ -26,6 +26,15 @@ from typing import Any, Literal
 
 Confidence = Literal["high", "medium", "low"]
 
+# Where an answer came from. Three outcomes, not two.
+#
+# "abstention" was folded into "fallback" until the counts were read back
+# and `by_fallback: 3` turned out to mean three models declining to guess,
+# not three failures to reach a model. Those are opposite results — one is
+# the system working well, the other is it degrading — and a benchmark
+# that cannot tell them apart is measuring the wrong thing (D-039).
+Source = Literal["model", "abstention", "fallback"]
+
 # A diagnosis that cites nothing is rejected. The model can legitimately fail to
 # reach a conclusion, and `Diagnosis.unknown` is how it says so — but an
 # uncited assertion is the thing this module exists to stop.
@@ -56,7 +65,7 @@ class Diagnosis:
     # "model" when a model produced it, "fallback" when the deterministic
     # template did. Recorded because the benchmark scores them separately and
     # a fallback counted as a diagnosis would flatter the results.
-    source: Literal["model", "fallback"] = "model"
+    source: Source = "model"
     # Why the fallback fired, verbatim. A rate limit, a network failure and a
     # diagnosis that failed the citation check are three quite different
     # problems, and without this they are indistinguishable in the store —
@@ -96,7 +105,10 @@ class Diagnosis:
             evidence_cited=[],
             recommended_action="escalate to a human — the evidence was insufficient",
             model=model,
-            source="fallback",
+            # Not a fallback. The model was reached, understood the evidence,
+            # and declined to guess — which is a correct answer and must not
+            # be counted as degradation.
+            source="abstention",
         )
 
 

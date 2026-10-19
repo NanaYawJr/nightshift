@@ -213,6 +213,7 @@ def summarise(frame: pd.DataFrame | None = None) -> dict[str, int]:
 
     if "diagnosis_source" in frame.columns:
         counts["by_model"] = int((frame["diagnosis_source"] == "model").sum())
+        counts["abstained"] = int((frame["diagnosis_source"] == "abstention").sum())
         counts["by_fallback"] = int((frame["diagnosis_source"] == "fallback").sum())
 
     counts["pending"] = len(pending())

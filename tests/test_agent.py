@@ -241,9 +241,19 @@ def test_an_abstention_needs_no_citations():
     validate(Diagnosis.unknown("INC-test", "test-model", "not enough signal"), set())
 
 
-def test_an_abstention_is_recorded_as_a_fallback():
-    """So the benchmark never counts it as the model's work."""
-    assert Diagnosis.unknown("INC-test", "m", "r").source == "fallback"
+def test_an_abstention_is_its_own_outcome():
+    """D-039. Not "model", because the model asserted nothing. Not
+    "fallback", because the model was reached and chose to decline — which is
+    a correct answer, not a degradation."""
+    assert Diagnosis.unknown("INC-test", "m", "r").source == "abstention"
+
+
+def test_an_unreachable_model_is_still_a_fallback():
+    """The distinction only means something if the other side holds."""
+    assert template_diagnosis(
+        evidence.build(an_incident(), some_runs(), some_commits(), now=NOW),
+        reason="rate limited",
+    ).source == "fallback"
 
 
 # --- Parsing what models actually return ----------------------------------
@@ -344,6 +354,7 @@ def test_an_abstaining_model_is_not_turned_into_a_cause(monkeypatch, pack):
     result = diagnostician.diagnose(pack, "silent_zero_row")
 
     assert result.cause == "undetermined"
+    assert result.source == "abstention"
     assert "several causes" in result.reasoning
 
 
