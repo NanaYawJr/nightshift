@@ -45,6 +45,12 @@ NATURAL_KEYS: dict[str, tuple[str, ...]] = {
     # file that changes, so the moment is part of the identity — two snapshots
     # of one file at different times are two facts, not a duplicate.
     "landing_files": ("source_name", "collected_at"),
+    # Not telemetry, but the same shape of problem. An incident is written
+    # once when detected, again when diagnosed, again when a human rules on
+    # it — each time carrying only the fields that observation knows. The
+    # collapsing rule reassembles them, and a second implementation of that
+    # rule would be a second thing to keep correct (store.incidents).
+    "incidents": ("incident_id",),
 }
 
 

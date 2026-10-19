@@ -1170,3 +1170,893 @@ evaluation harness, which is the project's actual deliverable.
 `detect_now.py` stays as scratch and is not part of the system. Its hardcoded
 `EVALUATE_BEFORE` is a symptom of the same problem: the value is printed in one
 place and typed in another.
+
+---
+
+## D-030 — Spark names a Lakehouse table in another workspace with four quoted parts
+
+**Date:** 2026-10-07
+**Status:** Accepted, implemented
+
+**Context.** `10_collect` runs in `h1-nightshift` and must read the Delta log of
+tables in `lh_finance_bronze`, which lives in `h1-finance-prod`. The first
+attempt named them `lh_finance_bronze.dbo.ledger_daily` and collected nothing —
+`delta_commits` wrote zero rows and the notebook reported success.
+
+`dbo` is real, but it belongs to two different naming systems that happen to
+agree. The SQL analytics endpoint and Power BI see a Lakehouse table as
+`<lakehouse>.dbo.<table>`. Spark, in a schema-enabled Lakehouse, sees a
+three-part namespace: `<workspace>.<lakehouse>.<schema>`. `SHOW DATABASES` in
+the notebook returns exactly one row — `h1-nightshift.lh_nightshift.dbo` — the
+attached default Lakehouse and nothing else.
+
+Given a two- or three-part name, Spark resolves it relative to the current
+schema, producing
+`spark_catalog.default.h1-nightshift.lh_nightshift.lh_finance_bronze`, which
+does not exist.
+
+Two forms were verified against the live estate, both returning 147 versions:
+
+- `` `h1-finance-prod`.`lh_finance_bronze`.`dbo`.`ledger_daily` ``
+- ``delta.`abfss://h1-finance-prod@onelake.dfs.fabric.microsoft.com/lh_finance_bronze.Lakehouse/Tables/dbo/ledger_daily` ``
+
+The backticks are not optional in the first form: the workspace name contains
+hyphens, which Spark's parser would otherwise read as subtraction.
+
+**Decision.** Use the four-part quoted catalog name. The OneLake path also
+works, but `delta_commits._count_at` calls `spark.read...table()`, which takes a
+catalog name and not a path, so the path form would have required changing the
+collector as well as its configuration.
+
+Qualification stays in exactly one constant, in one cell. The D-018 workspace
+rename lands there and nowhere else.
+
+**Consequences.** A wrong table name is not an error. `delta_commits.collect`
+skips a table it cannot read, by design — an estate loses and gains tables, and
+a collector that stops at the first missing one stops collecting everything
+after it. The cost of that choice is that a typo and a decommissioned table look
+identical, and both look like health.
+
+**Also implied.** Spark's view of the estate is not the SQL endpoint's view, and
+the project now touches both. Anywhere a table is named, which system is doing
+the reading has to be established first rather than assumed from the last place
+the name was seen working.
+
+---
+
+## D-031 — Append-only telemetry is deduplicated at read time, never in the store
+
+**Date:** 2026-10-08
+**Status:** Accepted, implemented
+
+**Context.** The first successful Fabric collection reported 336 `job_runs`
+where 168 runs had happened, and 56 `items` where there were 28. `10_collect`
+Cell 4 had been run twice during debugging, and the store appended both times.
+
+That is D-028 working as intended. It is also an input that produces wrong
+answers. `silent_zero_row._rows_delivered` **sums** `rows_added` across the
+commits in a run's window, so a duplicated 5,000-row commit reads as 10,000
+delivered — which would hide a partial delivery sitting below a `minimum_rows`
+threshold. Duplicated runs emit the same incident twice.
+
+**Decision.** The store stays append-only and is never cleaned. Detection reads
+through `detection/telemetry.py`, which collapses each dataset to one row per
+natural key and keeps the **most recently collected** version of it.
+
+Natural keys are declared per dataset, not inferred:
+
+| Dataset | Key |
+|---|---|
+| `items` | `item_id` |
+| `job_runs` | `run_id` |
+| `datasets` | `dataset_id` |
+| `refresh_runs` | `dataset_id`, `refresh_id` |
+| `delta_commits` | `workspace_name`, `table_name`, `version` |
+
+Last-collected rather than first matters: a run observed as `InProgress` and
+collected again once `Completed` must resolve to `Completed`.
+
+A key column that no longer exists raises rather than skipping deduplication, so
+a renamed column is a loud failure instead of a silent return of the doubling
+bug. A dataset with no declared key is returned as stored — guessing a key risks
+discarding real rows, and a duplicate is visible in a count while a dropped row
+is not.
+
+**Consequences.** Deduplication is a view, so the raw record of what was known
+when survives intact. Any future reader that goes to `storage.read` directly
+gets duplicates, which is correct but is a trap; `telemetry.load` is the
+supported entry point for anything that computes.
+
+The stored-against-unique counts are printed at the top of every detection run.
+A widening gap is normal — it is collection history accumulating. A gap that
+jumps in one dataset means a schedule overlapping itself.
+
+**Also implied.** This module is where timestamp normalisation belongs too.
+Spark writes an aware timestamp to Delta correctly and hands it back to pandas
+with the timezone stripped, so a frame that has been through Delta no longer
+compares against one that has not. That is D-007 for the fourth time, and it is
+now fixed in one place rather than at each call site.
+
+---
+
+## D-032 — A configured name is verified against telemetry before detection is believed
+
+**Date:** 2026-10-08
+**Status:** Accepted, implemented
+
+**Context.** Detection has now reported a clean estate three times while the
+estate was broken, and not once because a rule was wrong:
+
+- D-025/026 — the rule checked that a commit existed rather than what it
+  carried. Twenty-three hours of nothing read as healthy.
+- D-027 — four silent runs on 2 October were inside the evaluation window and
+  missed, and the result was described as having no false positives.
+- D-030 — the estate's tables were named in the SQL endpoint's dialect, so
+  `delta_commits` collected nothing and there was nothing to detect against.
+
+A fourth was caught before it ran. The four-part Spark name is backtick-quoted,
+and the code that shortened `` `ledger_daily` `` for storage stripped only the
+qualification, leaving the quotes. `WriteExpectation.table` is `ledger_daily`
+unquoted, so it would have matched no commit and produced zero incidents over a
+fully working collection.
+
+Every one of these presents identically: a successful run, no errors, and an
+empty result. The same signature as the faults the project exists to find.
+
+**Decision.** Nothing configured by hand is trusted against telemetry without
+being checked against it first. `20_detect` resolves every expectation before
+running a rule, and prints the actual contents of `item_name` and `table_name`
+when one does not resolve.
+
+Short names are stored unquoted. The shortening is a named function with the
+reason in its docstring, not an inline `split`.
+
+**Consequences.** An expectation that names something that does not exist is now
+noisy instead of quiet. Decommission a pipeline and detection complains until
+the expectation is removed, which is the correct direction for a tool whose
+output is trusted when it says nothing is wrong.
+
+**Also implied.** "Zero incidents" is not a result on its own and should never
+be reported as one. It is a result only alongside evidence that the inputs
+resolved — which is why the stored-against-unique counts, the resolution check
+and the evaluation cutoff are all printed before the count.
+
+---
+
+## D-030 — Spark names a Lakehouse table in another workspace with four quoted parts
+
+**Date:** 2026-10-07
+**Status:** Accepted, implemented
+
+**Context.** `10_collect` runs in `h1-nightshift` and must read the Delta log of
+tables in `lh_finance_bronze`, which lives in `h1-finance-prod`. The first
+attempt named them `lh_finance_bronze.dbo.ledger_daily` and collected nothing —
+`delta_commits` wrote zero rows and the notebook reported success.
+
+`dbo` is real, but it belongs to two different naming systems that happen to
+agree. The SQL analytics endpoint and Power BI see a Lakehouse table as
+`<lakehouse>.dbo.<table>`. Spark, in a schema-enabled Lakehouse, sees a
+three-part namespace: `<workspace>.<lakehouse>.<schema>`. `SHOW DATABASES` in
+the notebook returns exactly one row — `h1-nightshift.lh_nightshift.dbo` — the
+attached default Lakehouse and nothing else.
+
+Given a two- or three-part name, Spark resolves it relative to the current
+schema, producing
+`spark_catalog.default.h1-nightshift.lh_nightshift.lh_finance_bronze`, which
+does not exist.
+
+Two forms were verified against the live estate, both returning 147 versions:
+
+- `` `h1-finance-prod`.`lh_finance_bronze`.`dbo`.`ledger_daily` ``
+- ``delta.`abfss://h1-finance-prod@onelake.dfs.fabric.microsoft.com/lh_finance_bronze.Lakehouse/Tables/dbo/ledger_daily` ``
+
+The backticks are not optional in the first form: the workspace name contains
+hyphens, which Spark's parser would otherwise read as subtraction.
+
+**Decision.** Use the four-part quoted catalog name. The OneLake path also
+works, but `delta_commits._count_at` calls `spark.read...table()`, which takes a
+catalog name and not a path, so the path form would have required changing the
+collector as well as its configuration.
+
+Qualification stays in exactly one constant, in one cell. The D-018 workspace
+rename lands there and nowhere else.
+
+**Consequences.** A wrong table name is not an error. `delta_commits.collect`
+skips a table it cannot read, by design — an estate loses and gains tables, and
+a collector that stops at the first missing one stops collecting everything
+after it. The cost of that choice is that a typo and a decommissioned table look
+identical, and both look like health.
+
+**Also implied.** Spark's view of the estate is not the SQL endpoint's view, and
+the project now touches both. Anywhere a table is named, which system is doing
+the reading has to be established first rather than assumed from the last place
+the name was seen working.
+
+---
+
+## D-031 — Append-only telemetry is deduplicated at read time, never in the store
+
+**Date:** 2026-10-08
+**Status:** Accepted, implemented
+
+**Context.** The first successful Fabric collection reported 336 `job_runs`
+where 168 runs had happened, and 56 `items` where there were 28. `10_collect`
+Cell 4 had been run twice during debugging, and the store appended both times.
+
+That is D-028 working as intended. It is also an input that produces wrong
+answers. `silent_zero_row._rows_delivered` **sums** `rows_added` across the
+commits in a run's window, so a duplicated 5,000-row commit reads as 10,000
+delivered — which would hide a partial delivery sitting below a `minimum_rows`
+threshold. Duplicated runs emit the same incident twice.
+
+**Decision.** The store stays append-only and is never cleaned. Detection reads
+through `detection/telemetry.py`, which collapses each dataset to one row per
+natural key and keeps the **most recently collected** version of it.
+
+Natural keys are declared per dataset, not inferred:
+
+| Dataset | Key |
+|---|---|
+| `items` | `item_id` |
+| `job_runs` | `run_id` |
+| `datasets` | `dataset_id` |
+| `refresh_runs` | `dataset_id`, `refresh_id` |
+| `delta_commits` | `workspace_name`, `table_name`, `version` |
+
+Last-collected rather than first matters: a run observed as `InProgress` and
+collected again once `Completed` must resolve to `Completed`.
+
+A key column that no longer exists raises rather than skipping deduplication, so
+a renamed column is a loud failure instead of a silent return of the doubling
+bug. A dataset with no declared key is returned as stored — guessing a key risks
+discarding real rows, and a duplicate is visible in a count while a dropped row
+is not.
+
+**Consequences.** Deduplication is a view, so the raw record of what was known
+when survives intact. Any future reader that goes to `storage.read` directly
+gets duplicates, which is correct but is a trap; `telemetry.load` is the
+supported entry point for anything that computes.
+
+The stored-against-unique counts are printed at the top of every detection run.
+A widening gap is normal — it is collection history accumulating. A gap that
+jumps in one dataset means a schedule overlapping itself.
+
+**Also implied.** This module is where timestamp normalisation belongs too.
+Spark writes an aware timestamp to Delta correctly and hands it back to pandas
+with the timezone stripped, so a frame that has been through Delta no longer
+compares against one that has not. That is D-007 for the fourth time, and it is
+now fixed in one place rather than at each call site.
+
+---
+
+## D-032 — A configured name is verified against telemetry before detection is believed
+
+**Date:** 2026-10-08
+**Status:** Accepted, implemented
+
+**Context.** Detection has now reported a clean estate three times while the
+estate was broken, and not once because a rule was wrong:
+
+- D-025/026 — the rule checked that a commit existed rather than what it
+  carried. Twenty-three hours of nothing read as healthy.
+- D-027 — four silent runs on 2 October were inside the evaluation window and
+  missed, and the result was described as having no false positives.
+- D-030 — the estate's tables were named in the SQL endpoint's dialect, so
+  `delta_commits` collected nothing and there was nothing to detect against.
+
+A fourth was caught before it ran. The four-part Spark name is backtick-quoted,
+and the code that shortened `` `ledger_daily` `` for storage stripped only the
+qualification, leaving the quotes. `WriteExpectation.table` is `ledger_daily`
+unquoted, so it would have matched no commit and produced zero incidents over a
+fully working collection.
+
+Every one of these presents identically: a successful run, no errors, and an
+empty result. The same signature as the faults the project exists to find.
+
+**Decision.** Nothing configured by hand is trusted against telemetry without
+being checked against it first. `20_detect` resolves every expectation before
+running a rule, and prints the actual contents of `item_name` and `table_name`
+when one does not resolve.
+
+Short names are stored unquoted. The shortening is a named function with the
+reason in its docstring, not an inline `split`.
+
+**Consequences.** An expectation that names something that does not exist is now
+noisy instead of quiet. Decommission a pipeline and detection complains until
+the expectation is removed, which is the correct direction for a tool whose
+output is trusted when it says nothing is wrong.
+
+**Also implied.** "Zero incidents" is not a result on its own and should never
+be reported as one. It is a result only alongside evidence that the inputs
+resolved — which is why the stored-against-unique counts, the resolution check
+and the evaluation cutoff are all printed before the count.
+
+---
+
+## D-033 — Anything that runs unattended takes its libraries from an Environment
+
+**Date:** 2026-10-09
+**Status:** Accepted, implemented
+
+**Context.** `10_collect` opened with `%pip install pydantic-settings`. It
+worked every time it was run by hand. It failed every time Fabric ran it:
+
+```
+MagicUsageError: %pip magic command is disabled.
+```
+
+Inline installation is only available in an interactive session. After ten
+consecutive failures Fabric auto-disabled the scheduler, which is documented
+behaviour and the correct thing for the platform to do.
+
+The cell had been tested the only way it could be tested interactively, and
+interactive testing could never have found this. The failure mode exists
+exclusively in the environment the cell was written for.
+
+**Decision.** No scheduled notebook contains a library install. Dependencies
+come from a workspace Environment, pinned, published before the notebook runs.
+`env_nightshift` in `h1-nightshift` holds `pydantic-settings`; the notebooks
+select it in the ribbon.
+
+The Environment lives in `h1-nightshift`, not in `h1-finance-prod` where an
+earlier one already existed. Nightshift must not take a dependency on the
+estate it observes, because the estate is torn down and rebuilt as part of the
+fault work (D-029).
+
+Each notebook's first cell now imports `pydantic_settings` inside a try/except
+and raises a message naming the Environment. Without it the failure surfaces
+three cells later as an `ImportError` on a module nobody recognises.
+
+**Consequences.** Sessions take two to three minutes to start instead of
+twenty seconds, because a custom environment image has to load. That is the
+price of libraries being available in unattended runs, and it is worth paying.
+
+Adding a dependency is now a publish-and-wait operation rather than a line in
+a cell. That friction is a feature: a dependency that is not worth ten minutes
+is not worth having in a scheduled job.
+
+**Also implied.** "It works when I run it" is not evidence that a scheduled
+job works. The two execution paths differ in ways that are invisible from the
+interactive one, and the only proof that a schedule works is a successful
+scheduled run — not a successful manual run and an enabled toggle.
+
+---
+
+## D-034 — The stored Delta schema is authoritative; each batch conforms to it
+
+**Date:** 2026-10-09
+**Status:** Accepted, implemented
+
+**Context.** `delta_commits` collection failed with:
+
+```
+[DELTA_FAILED_TO_MERGE_FIELDS] Failed to merge fields 'rows_added' and 'rows_added'
+```
+
+from a collector whose code had not changed since the last successful run.
+
+`tel_delta_commits` was created on 7 October from a batch that contained some
+nulls in `rows_added`. Pandas cannot hold integers alongside nulls, so it used
+`float64` and Delta stored the column as `DOUBLE`. Two days later the counting
+window covered every version, no nulls were produced, pandas used `int64`, and
+Spark offered `BIGINT`. `mergeSchema` adds new columns but will not change an
+existing column's type.
+
+The column's type was being decided by whatever happened to be in each batch.
+The better the data got, the more certain the failure became.
+
+**Decision.** Before writing, `LakehouseDelta.write` reads the existing table's
+column types and casts the batch to match. Only columns present in both are
+touched; a genuinely new column still arrives through `mergeSchema` with its
+inferred type. Every cast is printed, because widening is harmless and
+narrowing truncates, and a silent truncation in telemetry surfaces weeks later
+as an inexplicable result.
+
+The rule is a pure function over two dictionaries, `casts_needed`, so it is
+tested without Spark.
+
+**Consequences.** The first write to a dataset defines its schema permanently,
+which makes the first write worth more care than the rest. A column that
+genuinely needs a different type requires a migration, not a hopeful append.
+
+**Also implied.** This is the third bug of one family: a column whose type or
+presence depends on what a single batch happened to contain. All-null columns
+typed as VOID, duplicate rows, and now shifting dtypes. One root — pandas
+infers per batch, Delta remembers forever — and the boundary between them is
+the right place to fix all three.
+
+---
+
+## D-035 — Deduplication keeps the latest known value of each field, not the latest row
+
+**Date:** 2026-10-14
+**Status:** Accepted, implemented
+
+**Context.** After a successful collection, 134 commits that had a measured
+row count on 7 October showed `NaN`.
+
+Nothing was deleted. `rows_added` is computed only for the most recent
+`max_counted` versions, and `ledger_daily` had grown past that window, so the
+new batch reported null for commits an earlier batch had measured exactly.
+Deduplication kept the latest row per key, and the latest row said unknown.
+
+The record got worse by being collected again. Left alone, `_rows_delivered`
+would have returned None for those runs, detection would have skipped them,
+and roughly half the known incidents would have quietly disappeared — a false
+negative caused entirely by collecting more data.
+
+**Decision.** Deduplication resolves field by field: for each key, the newest
+non-null value of every column wins.
+
+A run observed as `InProgress` and later as `Completed` still resolves to
+`Completed`, because `Completed` is the newest non-null status. A measurement
+that stops being reported keeps the last value anyone actually observed, which
+for immutable telemetry — a commit's row count never changes — is the only
+honest answer.
+
+**Consequences.** A field that legitimately becomes null keeps its old value.
+Nothing in this project's telemetry does that, and the alternative has already
+destroyed data once.
+
+The append-only store was what made recovery possible. The 134 measurements
+were never gone, only hidden by the view, and changing the view brought them
+back. D-028 paid for itself here.
+
+**Also implied.** `max_counted` is still a sliding window. With hourly
+collection every commit falls inside it at least once, so nothing is missed —
+but collection stopping for more than about eight days would create commits
+that are never measured at all. The fix is to skip versions already measured,
+which also stops runtime growing with history. Not yet built.
+
+---
+
+## D-036 — The collector is monitored like anything else in the estate
+
+**Date:** 2026-10-14
+**Status:** Accepted, implemented
+
+**Context.** The collection schedule has died silently twice.
+
+On 8 October it hit the `%pip` cell (D-033), failed ten times, and Fabric
+auto-disabled it. For 38 hours detection reported 72 incidents with precise
+boundaries and the agent diagnosed six of them with high confidence, all
+against telemetry frozen on the 7th. On 9 October it died again on the Delta
+schema collision (D-034) and nothing was collected for five days.
+
+Neither outage was detected by the system. Both were noticed by a human
+comparing numbers against memory — the second only because three figures in an
+evidence pack looked unchanged.
+
+D-028 closed with the observation that a rule over the collectors would catch
+exactly this. It was not built, and it happened twice.
+
+**Decision.** `detection/rules/collection_gap.py`. For each dataset, compare
+the newest `collected_at` against now; fire when the gap exceeds twice the
+declared collection interval, with severity rising at six. A dataset never
+collected is a separate, high-severity case — an empty table is
+indistinguishable from a healthy estate to every rule that reads it.
+
+Three properties the rule depends on:
+
+- **Keyed on when the silence began**, not on now, so one outage produces one
+  incident however often detection runs during it. The alternative files a
+  fresh incident every hour for one problem, which is how an alert becomes
+  noise and then gets ignored.
+- **Reads the raw store, not the deduplicated view.** Deduplication answers
+  "what is true"; this asks "when did anyone last look", and a collection that
+  found nothing new still proves somebody looked.
+- **The declared interval decides, not the clock.** A daily dataset six hours
+  late is fine; an hourly one is broken.
+
+`20_detect` runs it first and prints a banner when collection is behind,
+before any other number appears.
+
+**Consequences.** Collection intervals are now configuration that has to be
+maintained. A dataset whose schedule changes without the expectation changing
+produces a false alarm — the same cost as `WriteExpectation`, accepted for the
+same reason (D-025).
+
+**Also implied.** This is the project's thesis demonstrated on itself, and it
+belongs in the published results rather than in a footnote. A monitoring
+system that cannot observe its own silence is not a monitoring system; it is a
+report that happened to be true once. Every detection result between 8 and 14
+October was confidently wrong in exactly the way the system exists to prevent,
+and the only reason it was caught is that a human still happened to be looking.
+
+---
+
+## D-030 — Spark names a Lakehouse table in another workspace with four quoted parts
+
+**Date:** 2026-10-07
+**Status:** Accepted, implemented
+
+**Context.** `10_collect` runs in `h1-nightshift` and must read the Delta log of
+tables in `lh_finance_bronze`, which lives in `h1-finance-prod`. The first
+attempt named them `lh_finance_bronze.dbo.ledger_daily` and collected nothing —
+`delta_commits` wrote zero rows and the notebook reported success.
+
+`dbo` is real, but it belongs to two different naming systems that happen to
+agree. The SQL analytics endpoint and Power BI see a Lakehouse table as
+`<lakehouse>.dbo.<table>`. Spark, in a schema-enabled Lakehouse, sees a
+three-part namespace: `<workspace>.<lakehouse>.<schema>`. `SHOW DATABASES` in
+the notebook returns exactly one row — `h1-nightshift.lh_nightshift.dbo` — the
+attached default Lakehouse and nothing else.
+
+Given a two- or three-part name, Spark resolves it relative to the current
+schema, producing
+`spark_catalog.default.h1-nightshift.lh_nightshift.lh_finance_bronze`, which
+does not exist.
+
+Two forms were verified against the live estate, both returning 147 versions:
+
+- `` `h1-finance-prod`.`lh_finance_bronze`.`dbo`.`ledger_daily` ``
+- ``delta.`abfss://h1-finance-prod@onelake.dfs.fabric.microsoft.com/lh_finance_bronze.Lakehouse/Tables/dbo/ledger_daily` ``
+
+The backticks are not optional in the first form: the workspace name contains
+hyphens, which Spark's parser would otherwise read as subtraction.
+
+**Decision.** Use the four-part quoted catalog name. The OneLake path also
+works, but `delta_commits._count_at` calls `spark.read...table()`, which takes a
+catalog name and not a path, so the path form would have required changing the
+collector as well as its configuration.
+
+Qualification stays in exactly one constant, in one cell. The D-018 workspace
+rename lands there and nowhere else.
+
+**Consequences.** A wrong table name is not an error. `delta_commits.collect`
+skips a table it cannot read, by design — an estate loses and gains tables, and
+a collector that stops at the first missing one stops collecting everything
+after it. The cost of that choice is that a typo and a decommissioned table look
+identical, and both look like health.
+
+**Also implied.** Spark's view of the estate is not the SQL endpoint's view, and
+the project now touches both. Anywhere a table is named, which system is doing
+the reading has to be established first rather than assumed from the last place
+the name was seen working.
+
+---
+
+## D-031 — Append-only telemetry is deduplicated at read time, never in the store
+
+**Date:** 2026-10-08
+**Status:** Accepted, implemented
+
+**Context.** The first successful Fabric collection reported 336 `job_runs`
+where 168 runs had happened, and 56 `items` where there were 28. `10_collect`
+Cell 4 had been run twice during debugging, and the store appended both times.
+
+That is D-028 working as intended. It is also an input that produces wrong
+answers. `silent_zero_row._rows_delivered` **sums** `rows_added` across the
+commits in a run's window, so a duplicated 5,000-row commit reads as 10,000
+delivered — which would hide a partial delivery sitting below a `minimum_rows`
+threshold. Duplicated runs emit the same incident twice.
+
+**Decision.** The store stays append-only and is never cleaned. Detection reads
+through `detection/telemetry.py`, which collapses each dataset to one row per
+natural key and keeps the **most recently collected** version of it.
+
+Natural keys are declared per dataset, not inferred:
+
+| Dataset | Key |
+|---|---|
+| `items` | `item_id` |
+| `job_runs` | `run_id` |
+| `datasets` | `dataset_id` |
+| `refresh_runs` | `dataset_id`, `refresh_id` |
+| `delta_commits` | `workspace_name`, `table_name`, `version` |
+
+Last-collected rather than first matters: a run observed as `InProgress` and
+collected again once `Completed` must resolve to `Completed`.
+
+A key column that no longer exists raises rather than skipping deduplication, so
+a renamed column is a loud failure instead of a silent return of the doubling
+bug. A dataset with no declared key is returned as stored — guessing a key risks
+discarding real rows, and a duplicate is visible in a count while a dropped row
+is not.
+
+**Consequences.** Deduplication is a view, so the raw record of what was known
+when survives intact. Any future reader that goes to `storage.read` directly
+gets duplicates, which is correct but is a trap; `telemetry.load` is the
+supported entry point for anything that computes.
+
+The stored-against-unique counts are printed at the top of every detection run.
+A widening gap is normal — it is collection history accumulating. A gap that
+jumps in one dataset means a schedule overlapping itself.
+
+**Also implied.** This module is where timestamp normalisation belongs too.
+Spark writes an aware timestamp to Delta correctly and hands it back to pandas
+with the timezone stripped, so a frame that has been through Delta no longer
+compares against one that has not. That is D-007 for the fourth time, and it is
+now fixed in one place rather than at each call site.
+
+---
+
+## D-032 — A configured name is verified against telemetry before detection is believed
+
+**Date:** 2026-10-08
+**Status:** Accepted, implemented
+
+**Context.** Detection has now reported a clean estate three times while the
+estate was broken, and not once because a rule was wrong:
+
+- D-025/026 — the rule checked that a commit existed rather than what it
+  carried. Twenty-three hours of nothing read as healthy.
+- D-027 — four silent runs on 2 October were inside the evaluation window and
+  missed, and the result was described as having no false positives.
+- D-030 — the estate's tables were named in the SQL endpoint's dialect, so
+  `delta_commits` collected nothing and there was nothing to detect against.
+
+A fourth was caught before it ran. The four-part Spark name is backtick-quoted,
+and the code that shortened `` `ledger_daily` `` for storage stripped only the
+qualification, leaving the quotes. `WriteExpectation.table` is `ledger_daily`
+unquoted, so it would have matched no commit and produced zero incidents over a
+fully working collection.
+
+Every one of these presents identically: a successful run, no errors, and an
+empty result. The same signature as the faults the project exists to find.
+
+**Decision.** Nothing configured by hand is trusted against telemetry without
+being checked against it first. `20_detect` resolves every expectation before
+running a rule, and prints the actual contents of `item_name` and `table_name`
+when one does not resolve.
+
+Short names are stored unquoted. The shortening is a named function with the
+reason in its docstring, not an inline `split`.
+
+**Consequences.** An expectation that names something that does not exist is now
+noisy instead of quiet. Decommission a pipeline and detection complains until
+the expectation is removed, which is the correct direction for a tool whose
+output is trusted when it says nothing is wrong.
+
+**Also implied.** "Zero incidents" is not a result on its own and should never
+be reported as one. It is a result only alongside evidence that the inputs
+resolved — which is why the stored-against-unique counts, the resolution check
+and the evaluation cutoff are all printed before the count.
+
+---
+
+## D-033 — Anything that runs unattended takes its libraries from an Environment
+
+**Date:** 2026-10-09
+**Status:** Accepted, implemented
+
+**Context.** `10_collect` opened with `%pip install pydantic-settings`. It
+worked every time it was run by hand. It failed every time Fabric ran it:
+
+```
+MagicUsageError: %pip magic command is disabled.
+```
+
+Inline installation is only available in an interactive session. After ten
+consecutive failures Fabric auto-disabled the scheduler, which is documented
+behaviour and the correct thing for the platform to do.
+
+The cell had been tested the only way it could be tested interactively, and
+interactive testing could never have found this. The failure mode exists
+exclusively in the environment the cell was written for.
+
+**Decision.** No scheduled notebook contains a library install. Dependencies
+come from a workspace Environment, pinned, published before the notebook runs.
+`env_nightshift` in `h1-nightshift` holds `pydantic-settings`; the notebooks
+select it in the ribbon.
+
+The Environment lives in `h1-nightshift`, not in `h1-finance-prod` where an
+earlier one already existed. Nightshift must not take a dependency on the
+estate it observes, because the estate is torn down and rebuilt as part of the
+fault work (D-029).
+
+Each notebook's first cell now imports `pydantic_settings` inside a try/except
+and raises a message naming the Environment. Without it the failure surfaces
+three cells later as an `ImportError` on a module nobody recognises.
+
+**Consequences.** Sessions take two to three minutes to start instead of
+twenty seconds, because a custom environment image has to load. That is the
+price of libraries being available in unattended runs, and it is worth paying.
+
+Adding a dependency is now a publish-and-wait operation rather than a line in
+a cell. That friction is a feature: a dependency that is not worth ten minutes
+is not worth having in a scheduled job.
+
+**Also implied.** "It works when I run it" is not evidence that a scheduled
+job works. The two execution paths differ in ways that are invisible from the
+interactive one, and the only proof that a schedule works is a successful
+scheduled run — not a successful manual run and an enabled toggle.
+
+---
+
+## D-034 — The stored Delta schema is authoritative; each batch conforms to it
+
+**Date:** 2026-10-09
+**Status:** Accepted, implemented
+
+**Context.** `delta_commits` collection failed with:
+
+```
+[DELTA_FAILED_TO_MERGE_FIELDS] Failed to merge fields 'rows_added' and 'rows_added'
+```
+
+from a collector whose code had not changed since the last successful run.
+
+`tel_delta_commits` was created on 7 October from a batch that contained some
+nulls in `rows_added`. Pandas cannot hold integers alongside nulls, so it used
+`float64` and Delta stored the column as `DOUBLE`. Two days later the counting
+window covered every version, no nulls were produced, pandas used `int64`, and
+Spark offered `BIGINT`. `mergeSchema` adds new columns but will not change an
+existing column's type.
+
+The column's type was being decided by whatever happened to be in each batch.
+The better the data got, the more certain the failure became.
+
+**Decision.** Before writing, `LakehouseDelta.write` reads the existing table's
+column types and casts the batch to match. Only columns present in both are
+touched; a genuinely new column still arrives through `mergeSchema` with its
+inferred type. Every cast is printed, because widening is harmless and
+narrowing truncates, and a silent truncation in telemetry surfaces weeks later
+as an inexplicable result.
+
+The rule is a pure function over two dictionaries, `casts_needed`, so it is
+tested without Spark.
+
+**Consequences.** The first write to a dataset defines its schema permanently,
+which makes the first write worth more care than the rest. A column that
+genuinely needs a different type requires a migration, not a hopeful append.
+
+**Also implied.** This is the third bug of one family: a column whose type or
+presence depends on what a single batch happened to contain. All-null columns
+typed as VOID, duplicate rows, and now shifting dtypes. One root — pandas
+infers per batch, Delta remembers forever — and the boundary between them is
+the right place to fix all three.
+
+---
+
+## D-035 — Deduplication keeps the latest known value of each field, not the latest row
+
+**Date:** 2026-10-14
+**Status:** Accepted, implemented
+
+**Context.** After a successful collection, 134 commits that had a measured
+row count on 7 October showed `NaN`.
+
+Nothing was deleted. `rows_added` is computed only for the most recent
+`max_counted` versions, and `ledger_daily` had grown past that window, so the
+new batch reported null for commits an earlier batch had measured exactly.
+Deduplication kept the latest row per key, and the latest row said unknown.
+
+The record got worse by being collected again. Left alone, `_rows_delivered`
+would have returned None for those runs, detection would have skipped them,
+and roughly half the known incidents would have quietly disappeared — a false
+negative caused entirely by collecting more data.
+
+**Decision.** Deduplication resolves field by field: for each key, the newest
+non-null value of every column wins.
+
+A run observed as `InProgress` and later as `Completed` still resolves to
+`Completed`, because `Completed` is the newest non-null status. A measurement
+that stops being reported keeps the last value anyone actually observed, which
+for immutable telemetry — a commit's row count never changes — is the only
+honest answer.
+
+**Consequences.** A field that legitimately becomes null keeps its old value.
+Nothing in this project's telemetry does that, and the alternative has already
+destroyed data once.
+
+The append-only store was what made recovery possible. The 134 measurements
+were never gone, only hidden by the view, and changing the view brought them
+back. D-028 paid for itself here.
+
+**Also implied.** `max_counted` is still a sliding window. With hourly
+collection every commit falls inside it at least once, so nothing is missed —
+but collection stopping for more than about eight days would create commits
+that are never measured at all. The fix is to skip versions already measured,
+which also stops runtime growing with history. Not yet built.
+
+---
+
+## D-036 — The collector is monitored like anything else in the estate
+
+**Date:** 2026-10-14
+**Status:** Accepted, implemented
+
+**Context.** The collection schedule has died silently twice.
+
+On 8 October it hit the `%pip` cell (D-033), failed ten times, and Fabric
+auto-disabled it. For 38 hours detection reported 72 incidents with precise
+boundaries and the agent diagnosed six of them with high confidence, all
+against telemetry frozen on the 7th. On 9 October it died again on the Delta
+schema collision (D-034) and nothing was collected for five days.
+
+Neither outage was detected by the system. Both were noticed by a human
+comparing numbers against memory — the second only because three figures in an
+evidence pack looked unchanged.
+
+D-028 closed with the observation that a rule over the collectors would catch
+exactly this. It was not built, and it happened twice.
+
+**Decision.** `detection/rules/collection_gap.py`. For each dataset, compare
+the newest `collected_at` against now; fire when the gap exceeds twice the
+declared collection interval, with severity rising at six. A dataset never
+collected is a separate, high-severity case — an empty table is
+indistinguishable from a healthy estate to every rule that reads it.
+
+Three properties the rule depends on:
+
+- **Keyed on when the silence began**, not on now, so one outage produces one
+  incident however often detection runs during it. The alternative files a
+  fresh incident every hour for one problem, which is how an alert becomes
+  noise and then gets ignored.
+- **Reads the raw store, not the deduplicated view.** Deduplication answers
+  "what is true"; this asks "when did anyone last look", and a collection that
+  found nothing new still proves somebody looked.
+- **The declared interval decides, not the clock.** A daily dataset six hours
+  late is fine; an hourly one is broken.
+
+`20_detect` runs it first and prints a banner when collection is behind,
+before any other number appears.
+
+**Consequences.** Collection intervals are now configuration that has to be
+maintained. A dataset whose schedule changes without the expectation changing
+produces a false alarm — the same cost as `WriteExpectation`, accepted for the
+same reason (D-025).
+
+**Also implied.** This is the project's thesis demonstrated on itself, and it
+belongs in the published results rather than in a footnote. A monitoring
+system that cannot observe its own silence is not a monitoring system; it is a
+report that happened to be true once. Every detection result between 8 and 14
+October was confidently wrong in exactly the way the system exists to prevent,
+and the only reason it was caught is that a human still happened to be looking.
+
+---
+
+## D-037 — The backup is protected the way the seal is
+
+**Date:** 2026-10-15
+**Status:** Accepted, implemented
+
+**Context.** A controlled injection of `silent_zero_row` was followed, an hour
+later, by running every cell in the injection notebook again. Two things
+happened in that order:
+
+1. `inject_and_seal` called `inject()`, which called `_apply()`, which ran
+   `shutil.copy2(source, backup)`. The source at that moment was the
+   128-byte header-only file the first injection had produced. The backup —
+   the only copy of the original 604,780-byte landing file — was overwritten
+   with it.
+2. `Seal.store` then raised `FileExistsError` and refused to overwrite the
+   ground truth.
+
+The seal did exactly what D-022 built it to do. The data had no equivalent
+protection, so the record of what was done survived in perfect condition while
+the ability to undo it was destroyed. The estate had to be regenerated rather
+than restored.
+
+**Decision.** `SilentZeroRow._apply` refuses to run when a backup already
+exists, with a message saying the fault appears to be injected and that
+overwriting would destroy the original. `revert` removes the backup, so a
+reverted fault can be injected again and the guard does not make the estate
+single-use.
+
+**Consequences.** Re-running an injection is now a loud failure before it
+touches anything, rather than a silent one after.
+
+A notebook where "Run all" destroys data is a hazard regardless of guards, and
+the injection notebook is scratch by nature. The guard is the fix; the habit of
+not running all cells in it is not a fix.
+
+**Also implied.** Two smaller gaps surfaced in the same incident and are not
+yet closed.
+
+`Fault.from_ground_truth` cannot be called on the base class — it compares
+`truth.fault_class` against `cls.fault_class`, which the abstract class does
+not define. The working form is
+`IMPLEMENTED[truth.fault_class].from_ground_truth(truth)`.
+
+The seal cannot record a revert. `GroundTruth` has a `reverted_at` field,
+`Seal.store` refuses to overwrite, and no update method exists — so a reverted
+fault is indistinguishable in the seal from one still live. The benchmark needs
+each fault's end time to define the window it scores against, so this has to be
+built before the harness.
+
+**And the general case.** The seal protects the record of what was done. The
+backup protects the ability to undo it. Both are needed, only one existed, and
+an audit trail that outlives the thing it is auditing is a particular kind of
+useless.
