@@ -162,6 +162,18 @@ class Fault(ABC):
         self._injected_at = None
         self._revert_state = {}
 
+    def revert_and_record(self, spark: Any, seal: "Seal") -> "GroundTruth":
+        """Revert and close the sealed record, in one step.
+
+        The mirror of `inject_and_seal`, and needed for the same reason. A
+        fault reverted without recording it looks identical in the seal to one
+        still live, so the harness has no way to know which window to score
+        against — it would judge a healthy estate against a fault that ended
+        days ago (D-041).
+        """
+        self.revert(spark)
+        return seal.mark_reverted(self.fault_id)
+
     @classmethod
     def from_ground_truth(cls, truth: GroundTruth) -> "Fault":
         """Rebuild an injected instance from its sealed record.
@@ -239,10 +251,66 @@ class Seal:
     def list_ids(self) -> list[str]:
         return sorted(p.stem for p in self.path.glob("*.json"))
 
-    def discard(self, fault_id: str) -> None:
-        """Remove a sealed record after its fault has been reverted.
+    def mark_reverted(
+        self, fault_id: str, at: datetime | None = None
+    ) -> GroundTruth:
+        """Record when a fault ended. The only field a sealed record may gain.
 
-        Leaving it would let a later revert restore a backup that no longer
-        matches the estate.
+        `store` refuses to overwrite because the mechanism must never change
+        after the fact. An end time is different: it is not known at injection,
+        it can only be written once, and without it a reverted fault is
+        indistinguishable from a live one — so the harness cannot tell which
+        runs belong inside the fault window and which belong to the healthy
+        period either side (D-041).
+
+        Everything else in the record is rewritten byte-identically, so the
+        mechanism a diagnosis is scored against is still the one that was
+        sealed at injection.
+        """
+        truth = self.load(fault_id)
+
+        if truth.reverted_at is not None:
+            raise ValueError(
+                f"{fault_id} was already recorded as reverted at "
+                f"{truth.reverted_at.isoformat()}. A fault ends once."
+            )
+
+        truth.reverted_at = at or datetime.now(timezone.utc)
+        (self.path / f"{fault_id}.json").write_text(truth.to_json())
+
+        return truth
+
+    def active(self) -> list[str]:
+        """Faults injected and not yet recorded as reverted.
+
+        What a benchmark run checks before it starts. Injecting a second fault
+        while one is live makes every incident in the overlap ambiguous, and
+        nothing downstream can untangle it afterwards.
+        """
+        return [
+            fault_id
+            for fault_id in self.list_ids()
+            if self.load(fault_id).reverted_at is None
+        ]
+
+    def window(self, fault_id: str) -> tuple[datetime, datetime | None]:
+        """When the fault was live: (injected_at, reverted_at or None).
+
+        None as the end means still live, not "ended now". A caller scoring an
+        open window has to decide what to do about it rather than being handed
+        a timestamp that looks like a measurement.
+        """
+        truth = self.load(fault_id)
+
+        return truth.injected_at, truth.reverted_at
+
+    def discard(self, fault_id: str) -> None:
+        """Delete a sealed record entirely.
+
+        Superseded by `mark_reverted` and kept only for cleaning up a botched
+        injection. Its original purpose — stopping a later revert from
+        restoring a stale backup — is now served by the backup guard in
+        `SilentZeroRow._apply` (D-037), and deleting a record destroys the
+        ground truth a benchmark result rests on. Prefer `mark_reverted`.
         """
         (self.path / f"{fault_id}.json").unlink(missing_ok=True)

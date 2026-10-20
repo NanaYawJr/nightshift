@@ -647,3 +647,120 @@ def test_a_reverted_fault_can_be_injected_again(landing, tmp_path):
     second.inject(FakeSpark())
 
     assert landing.read_text().splitlines() == [HEADER]
+
+# --- A fault needs an end time (D-041) ------------------------------------
+
+
+def test_a_sealed_fault_starts_with_no_end_time(landing, tmp_path):
+    seal = Seal(tmp_path / "sealed")
+    fault = SilentZeroRow(
+        "ws", "pl", landing_path=str(landing), backup_dir=str(tmp_path / "backup")
+    )
+    truth = fault.inject_and_seal(FakeSpark(), seal)
+
+    assert truth.reverted_at is None
+    assert seal.active() == [truth.fault_id]
+
+
+def test_reverting_records_the_end_time(landing, tmp_path):
+    """Without this a reverted fault is indistinguishable from a live one, and
+    the harness scores a healthy estate against a fault that ended days ago."""
+    seal = Seal(tmp_path / "sealed")
+    fault = SilentZeroRow(
+        "ws", "pl", landing_path=str(landing), backup_dir=str(tmp_path / "backup")
+    )
+    truth = fault.inject_and_seal(FakeSpark(), seal)
+
+    closed = fault.revert_and_record(FakeSpark(), seal)
+
+    assert closed.reverted_at is not None
+    assert closed.reverted_at >= truth.injected_at
+    assert seal.active() == []
+
+
+def test_the_end_time_survives_a_reload(landing, tmp_path):
+    """It has to be on disk, not just on the object in this session."""
+    seal = Seal(tmp_path / "sealed")
+    fault = SilentZeroRow(
+        "ws", "pl", landing_path=str(landing), backup_dir=str(tmp_path / "backup")
+    )
+    truth = fault.inject_and_seal(FakeSpark(), seal)
+    fault.revert_and_record(FakeSpark(), seal)
+
+    assert Seal(tmp_path / "sealed").load(truth.fault_id).reverted_at is not None
+
+
+def test_the_mechanism_is_unchanged_by_recording_a_revert(landing, tmp_path):
+    """The only field a sealed record may gain. A diagnosis is scored against
+    the mechanism sealed at injection, so everything else must come back
+    byte-identical."""
+    seal = Seal(tmp_path / "sealed")
+    fault = SilentZeroRow(
+        "ws", "pl", landing_path=str(landing), backup_dir=str(tmp_path / "backup")
+    )
+    before = fault.inject_and_seal(FakeSpark(), seal)
+
+    fault.revert_and_record(FakeSpark(), seal)
+    after = seal.load(before.fault_id)
+
+    assert after.mechanism == before.mechanism
+    assert after.expected_symptom == before.expected_symptom
+    assert after.parameters == before.parameters
+    assert after.injected_at == before.injected_at
+
+
+def test_a_fault_ends_once(landing, tmp_path):
+    seal = Seal(tmp_path / "sealed")
+    fault = SilentZeroRow(
+        "ws", "pl", landing_path=str(landing), backup_dir=str(tmp_path / "backup")
+    )
+    truth = fault.inject_and_seal(FakeSpark(), seal)
+    seal.mark_reverted(truth.fault_id)
+
+    with pytest.raises(ValueError, match="already recorded as reverted"):
+        seal.mark_reverted(truth.fault_id)
+
+
+def test_the_window_of_a_live_fault_has_no_end(landing, tmp_path):
+    """None rather than "now". A caller scoring an open window must decide
+    what to do about it, not be handed something that looks measured."""
+    seal = Seal(tmp_path / "sealed")
+    fault = SilentZeroRow(
+        "ws", "pl", landing_path=str(landing), backup_dir=str(tmp_path / "backup")
+    )
+    truth = fault.inject_and_seal(FakeSpark(), seal)
+
+    started, ended = seal.window(truth.fault_id)
+
+    assert started == truth.injected_at
+    assert ended is None
+
+
+def test_the_window_closes_on_revert(landing, tmp_path):
+    seal = Seal(tmp_path / "sealed")
+    fault = SilentZeroRow(
+        "ws", "pl", landing_path=str(landing), backup_dir=str(tmp_path / "backup")
+    )
+    truth = fault.inject_and_seal(FakeSpark(), seal)
+    fault.revert_and_record(FakeSpark(), seal)
+
+    started, ended = seal.window(truth.fault_id)
+
+    assert started < ended
+
+
+def test_active_distinguishes_live_faults_from_finished_ones(landing, tmp_path):
+    """What a benchmark run checks before starting. A second fault injected
+    while one is live makes every incident in the overlap ambiguous."""
+    seal = Seal(tmp_path / "sealed")
+    backup = tmp_path / "backup"
+
+    first = SilentZeroRow("ws", "pl", landing_path=str(landing), backup_dir=str(backup))
+    first_truth = first.inject_and_seal(FakeSpark(), seal)
+    first.revert_and_record(FakeSpark(), seal)
+
+    second = SilentZeroRow("ws", "pl2", landing_path=str(landing), backup_dir=str(backup))
+    second_truth = second.inject_and_seal(FakeSpark(), seal)
+
+    assert seal.active() == [second_truth.fault_id]
+    assert first_truth.fault_id in seal.list_ids()
