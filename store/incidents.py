@@ -32,6 +32,7 @@ from typing import Iterable, Sequence
 import pandas as pd
 
 from agent.diagnosis import Diagnosis
+from agent.proposal import Proposal
 from common import storage
 from detection.incident import Incident
 
@@ -46,6 +47,7 @@ DECISIONS = ("pending", "approved", "rejected", "superseded")
 def record(
     incidents: Iterable[Incident],
     diagnoses: dict[str, Diagnosis] | None = None,
+    proposals: dict[str, Proposal] | None = None,
 ) -> int:
     """Append incidents, with their diagnoses where they exist.
 
@@ -55,7 +57,15 @@ def record(
     one, and the read collapses them.
     """
     diagnoses = diagnoses or {}
-    rows = [_row(incident, diagnoses.get(incident.incident_id)) for incident in incidents]
+    proposals = proposals or {}
+    rows = [
+        _row(
+            incident,
+            diagnoses.get(incident.incident_id),
+            proposals.get(incident.incident_id),
+        )
+        for incident in incidents
+    ]
 
     if not rows:
         return 0
@@ -136,7 +146,11 @@ def pending() -> pd.DataFrame:
     return frame[frame["decision"].isna() | (frame["decision"] == "pending")]
 
 
-def _row(incident: Incident, diagnosis: Diagnosis | None) -> dict:
+def _row(
+    incident: Incident,
+    diagnosis: Diagnosis | None,
+    proposal: Proposal | None = None,
+) -> dict:
     """One incident as a flat row.
 
     `measured` and the cited-evidence list are stored as JSON text rather than
@@ -160,11 +174,20 @@ def _row(incident: Incident, diagnosis: Diagnosis | None) -> dict:
         "measured_json": json.dumps(incident.measured, default=str),
     }
 
-    if diagnosis is None:
+    if diagnosis is None and proposal is None:
         return row
 
-    row.update(
-        {
+    if diagnosis is not None:
+        row.update(_diagnosis_fields(diagnosis))
+
+    if proposal is not None:
+        row.update(_proposal_fields(proposal))
+
+    return row
+
+
+def _diagnosis_fields(diagnosis: Diagnosis) -> dict:
+    return {
             "diagnosis_cause": diagnosis.cause,
             "diagnosis_reasoning": diagnosis.reasoning,
             "diagnosis_confidence": diagnosis.confidence,
@@ -174,10 +197,26 @@ def _row(incident: Incident, diagnosis: Diagnosis | None) -> dict:
             "diagnosis_model": diagnosis.model,
             "fallback_reason": diagnosis.fallback_reason,
             "diagnosed_at": diagnosis.diagnosed_at,
-        }
-    )
+    }
 
-    return row
+
+def _proposal_fields(proposal: Proposal) -> dict:
+    """The proposed change, flat. `proposal_target` of "none" is a real
+    outcome — the agent judged no change warranted — and is not the same as
+    a row with no proposal at all, which means nobody has looked yet."""
+    return {
+        "proposal_target": proposal.target,
+        "proposal_summary": proposal.summary,
+        "proposal_change": proposal.change,
+        "proposal_rationale": proposal.rationale,
+        "proposal_prevents": proposal.prevents,
+        "proposal_risks": proposal.risks,
+        "proposal_confidence": proposal.confidence,
+        "proposal_cited_json": json.dumps(proposal.evidence_cited),
+        "proposal_source": proposal.source,
+        "proposal_model": proposal.model,
+        "proposed_at": proposal.proposed_at,
+    }
 
 
 def measured(frame: pd.DataFrame) -> pd.DataFrame:
@@ -215,6 +254,13 @@ def summarise(frame: pd.DataFrame | None = None) -> dict[str, int]:
         counts["by_model"] = int((frame["diagnosis_source"] == "model").sum())
         counts["abstained"] = int((frame["diagnosis_source"] == "abstention").sum())
         counts["by_fallback"] = int((frame["diagnosis_source"] == "fallback").sum())
+
+    if "proposal_target" in frame.columns:
+        counts["proposed"] = int(
+            frame["proposal_target"].notna().sum()
+            - (frame["proposal_target"] == "none").sum()
+        )
+        counts["no_change_warranted"] = int((frame["proposal_target"] == "none").sum())
 
     counts["pending"] = len(pending())
 
