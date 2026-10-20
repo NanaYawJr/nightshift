@@ -90,6 +90,21 @@ def decide(
     if decision not in DECISIONS:
         raise ValueError(f"decision must be one of {DECISIONS}, not {decision!r}")
 
+    # The id must already exist. Without this check a mistyped id does not
+    # fail — it appends a row with no incident attached, and the collapsing
+    # read turns that row into an incident of its own. One such row was
+    # created by a notebook placeholder reaching this function, and a
+    # fabricated incident in a benchmark's results is the worst kind of bug
+    # here: it looks exactly like data (D-043).
+    known = set(load()["incident_id"]) if not load().empty else set()
+
+    if incident_id not in known:
+        raise KeyError(
+            f"{incident_id} is not in the incident store, so there is nothing "
+            "to decide. Check the id — recording a decision cannot create an "
+            "incident."
+        )
+
     storage.write(
         DATASET,
         [
@@ -111,6 +126,11 @@ def link_to_fault(incident_id: str, fault_id: str) -> None:
     nothing upstream of scoring can see that an incident is synthetic. This
     field is what makes blind replay blind.
     """
+    known = set(load()["incident_id"]) if not load().empty else set()
+
+    if incident_id not in known:
+        raise KeyError(f"{incident_id} is not in the incident store (D-043).")
+
     storage.write(
         DATASET, [{"incident_id": incident_id, "benchmark_ref": fault_id}]
     )

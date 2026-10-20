@@ -266,3 +266,40 @@ def test_the_summary_counts_what_matters():
 
 def test_the_summary_of_an_empty_store_is_zero_not_an_error():
     assert incidents.summarise() == {"incidents": 0}
+
+
+# --- A decision cannot invent an incident (D-043) -------------------------
+
+
+def test_deciding_on_an_unknown_incident_is_refused():
+    """A notebook placeholder reached this function and created an incident
+    called INC-xxxxxxxxxx, decided and pending, sitting in the results like
+    data. A mistyped id has to fail, not append."""
+    incidents.record([an_incident()])
+
+    with pytest.raises(KeyError, match="not in the incident store"):
+        incidents.decide("INC-xxxxxxxxxx", "approved", "michael")
+
+
+def test_deciding_on_an_empty_store_is_refused():
+    with pytest.raises(KeyError):
+        incidents.decide("INC-anything", "approved", "michael")
+
+
+def test_a_refused_decision_writes_nothing():
+    """The check must happen before the append, or it only reports the
+    problem it has just caused."""
+    incidents.record([an_incident()])
+    before = len(storage.read("incidents"))
+
+    with pytest.raises(KeyError):
+        incidents.decide("INC-nope", "approved", "michael")
+
+    assert len(storage.read("incidents")) == before
+
+
+def test_linking_an_unknown_incident_to_a_fault_is_refused():
+    """Same hazard on the benchmark side, where it would attach ground truth
+    to an incident that never happened."""
+    with pytest.raises(KeyError):
+        incidents.link_to_fault("INC-nope", "some-fault-id")
