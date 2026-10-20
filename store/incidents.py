@@ -43,6 +43,18 @@ DATASET = "incidents"
 # distinguishable from one that was looked at and accepted.
 DECISIONS = ("pending", "approved", "rejected", "superseded")
 
+# How a diagnosis compares to the sealed record. Assigned by a human, because
+# "did it name the injected mechanism" is a judgement no string comparison
+# makes honestly.
+#
+# `restatement` is not in the original rubric and was added after the fact. A
+# diagnosis that says "the pipeline delivered zero rows" when the incident is
+# that the pipeline delivered zero rows names no mechanism at all, so neither
+# "wrong mechanism" nor "neither" describes it — and it is the failure that
+# looks most like success, being fluent and confident and carrying nothing the
+# detection rule had not already produced (D-044).
+VERDICTS = ("correct", "partial", "restatement", "incorrect", "abstained")
+
 
 def record(
     incidents: Iterable[Incident],
@@ -114,6 +126,35 @@ def decide(
                 "decided_by": decided_by,
                 "decided_at": datetime.now(timezone.utc),
                 "reviewer_note": note,
+            }
+        ],
+    )
+
+
+def judge(incident_id: str, verdict: str, judged_by: str, note: str = "") -> None:
+    """Record how a diagnosis compared to the sealed ground truth.
+
+    Separate from `decide`, which is about the proposed fix. A diagnosis can
+    be correct and its fix unusable, or the reverse, and collapsing the two
+    into one verdict would hide the most useful thing the benchmark measures.
+    """
+    if verdict not in VERDICTS:
+        raise ValueError(f"verdict must be one of {VERDICTS}, not {verdict!r}")
+
+    known = set(load()["incident_id"]) if not load().empty else set()
+
+    if incident_id not in known:
+        raise KeyError(f"{incident_id} is not in the incident store (D-043).")
+
+    storage.write(
+        DATASET,
+        [
+            {
+                "incident_id": incident_id,
+                "verdict": verdict,
+                "judged_by": judged_by,
+                "judged_at": datetime.now(timezone.utc),
+                "verdict_note": note,
             }
         ],
     )
