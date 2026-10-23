@@ -407,3 +407,12 @@ def test_dropping_does_not_lose_rows():
     )
 
     assert len(spark.last_frame) == 2
+
+def test_a_string_root_is_accepted(tmp_path):
+    """Found while reproducing a notebook failure: a plain string root crashed
+    on the first read, four frames from the call that caused it."""
+    storage.use_local(str(tmp_path / "as_text"))
+
+    storage.write("job_runs", ROWS)
+
+    assert len(storage.read("job_runs")) == 2

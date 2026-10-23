@@ -33,8 +33,21 @@ from typing import Any
 
 import pandas as pd
 
+from common import storage
 from estate.faults.base import Seal
 from store import incidents as store
+
+
+class NotConfigured(RuntimeError):
+    """Raised when there is no ground truth to score against (D-045).
+
+    A benchmark with no seal has no result — not a result of zero. This is the
+    third time this project has had to separate "nothing found" from "nothing
+    configured": the first produced 134 NaN row counts read as real zeros, the
+    second read a sampler's own coverage as an empty source, and the third
+    printed a table of zeros from a seal directory the code had created
+    itself. Refusing is cheaper than explaining.
+    """
 
 # A run that started before injection but finished after it was still reading
 # the pre-fault world for most of its life. Attributing it to the fault would
@@ -138,14 +151,27 @@ def results(
 
     Verdicts and decisions come from what a human recorded; everything else is
     derived. A key reading `None` means not yet judged, never zero.
+
+    Raises `NotConfigured` when the seal holds no faults, rather than
+    returning a summary of zeros (D-045). Reports the active storage backend
+    and seal path alongside the figures for the same reason: an unconfigured
+    run and a run that found nothing produce the same numbers, and the
+    difference has to be visible in the output rather than inferred.
     """
     frame = store.load() if frame is None else frame
     seal = seal or Seal()
+
+    _require_seal(seal)
 
     matched = match(frame, seal, now)
     detected = {f: ids for f, ids in matched.items() if ids}
 
     summary: dict[str, Any] = {
+        # Which backend the incident numbers came from. Printed because an
+        # empty store and a store nobody pointed at the Lakehouse produce
+        # identical figures, and only this line tells them apart.
+        "backend": storage.backend_name(),
+        "seal_path": str(seal.path),
         "faults_sealed": len(matched),
         "faults_detected": len(detected),
         "faults_missed": len(matched) - len(detected),
@@ -180,6 +206,28 @@ def results(
     summary["unjudged"] = len(frame) - int(judged)
 
     return summary
+
+
+def _require_seal(seal: Seal) -> None:
+    """Refuse to report anything when there is no ground truth.
+
+    Guards the two reporting functions rather than `match` and `latency`,
+    which are building blocks a caller hands an explicit seal and can
+    reasonably call against an empty one. It is the published figure that must
+    not be computable from nothing.
+    """
+    if seal.exists():
+        return
+
+    state = "is empty" if seal.path.exists() else "does not exist"
+
+    raise NotConfigured(
+        f"No sealed ground truth: {seal.path} {state}. Nothing can be scored "
+        "against it, and zeros here would read as measurements. Point Seal at "
+        "the directory holding the sealed records — in Fabric that is "
+        "Seal('/lakehouse/default/Files/sealed') with lh_nightshift pinned as "
+        "the default lakehouse."
+    )
 
 
 def _counts(frame: pd.DataFrame, column: str, prefix: str) -> dict[str, int]:
@@ -220,7 +268,18 @@ def table(
     frame = store.load() if frame is None else frame
     seal = seal or Seal()
 
-    lines = [f"{'fault':<50} {'incidents':>9} {'latency h':>10}  window"]
+    _require_seal(seal)
+
+    # The provenance line is part of the table, not decoration. A reader
+    # cannot judge the rows below without knowing which seal and which store
+    # produced them.
+    lines = [
+        f"seal     {seal.path}",
+        f"store    {storage.backend_name()}, {len(frame)} "
+        f"incident{'' if len(frame) == 1 else 's'}",
+        "",
+        f"{'fault':<50} {'incidents':>9} {'latency h':>10}  window",
+    ]
 
     for fault_id, ids in match(frame, seal, now).items():
         truth = seal.load(fault_id)

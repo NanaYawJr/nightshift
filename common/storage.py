@@ -41,8 +41,12 @@ class Backend(Protocol):
 class LocalParquet:
     """Partitioned Parquet on the local filesystem. The default."""
 
-    def __init__(self, root: Path = DATA_ROOT):
-        self.root = root
+    def __init__(self, root: str | Path = DATA_ROOT):
+        # Coerced, not assumed. A caller passing a plain string — which is the
+        # natural thing to type in a notebook — otherwise failed on the first
+        # read with `unsupported operand type(s) for /: 'str' and 'str'`,
+        # several frames away from the line that caused it.
+        self.root = Path(root)
 
     def write(self, dataset: str, frame: pd.DataFrame) -> str | None:
         collected_at = datetime.now(timezone.utc)
@@ -214,7 +218,7 @@ def use_lakehouse(spark: Any, prefix: str = "tel_") -> None:
     _backend = LakehouseDelta(spark, prefix=prefix)
 
 
-def use_local(root: Path = DATA_ROOT) -> None:
+def use_local(root: str | Path = DATA_ROOT) -> None:
     """Switch back to local Parquet. Mostly for tests."""
     global _backend
     _backend = LocalParquet(root)

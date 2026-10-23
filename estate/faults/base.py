@@ -219,8 +219,26 @@ class Seal:
     """
 
     def __init__(self, path: str | Path = "eval/sealed"):
+        # Deliberately does NOT create the directory (D-045).
+        #
+        # It used to. The effect was that constructing a Seal with the wrong
+        # path manufactured an empty ground-truth store at that path, and the
+        # harness then scored against it and reported zeros — a benchmark
+        # result produced by a directory the code had just invented. Creation
+        # belongs in `store`, which is the only method that has something to
+        # put there.
         self.path = Path(path)
-        self.path.mkdir(parents=True, exist_ok=True)
+
+    def exists(self) -> bool:
+        """Whether this path holds any sealed ground truth.
+
+        The check a caller makes before trusting a score. False means either
+        the directory is absent or it is empty, and in both cases there is
+        nothing to score against — so any figure derived from it would be
+        measuring the absence of a seal rather than the behaviour of the
+        system.
+        """
+        return bool(self.list_ids())
 
     def store(self, truth: GroundTruth) -> Path:
         """Write sealed ground truth. Refuses to overwrite.
@@ -228,6 +246,8 @@ class Seal:
         Scoring depends on these files, so a silent clobber would corrupt a
         benchmark run without any error. Loud failure is the right trade.
         """
+        self.path.mkdir(parents=True, exist_ok=True)
+
         target = self.path / f"{truth.fault_id}.json"
 
         if target.exists():

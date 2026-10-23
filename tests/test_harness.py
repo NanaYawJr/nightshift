@@ -217,11 +217,76 @@ def test_a_live_fault_is_reported_as_live(seal):
     assert harness.results(store.load(), seal)["faults_still_live"] == 1
 
 
-def test_results_on_an_empty_store_do_not_raise(seal):
+def test_a_sealed_fault_with_no_incidents_at_all_is_reported_as_missed(seal):
+    """An empty store is a result, not a configuration error: the fault was
+    injected and nothing was detected. This must never raise, because a miss
+    is the most important thing the harness has to say."""
+    seal.store(a_truth())
+
     summary = harness.results(store.load(), seal)
 
-    assert summary["faults_sealed"] == 0
+    assert summary["faults_sealed"] == 1
+    assert summary["faults_missed"] == 1
     assert summary["incidents_total"] == 0
+
+
+# --- Refusing to report nothing (D-045) ------------------------------------
+
+
+def test_results_refuse_a_seal_that_does_not_exist(tmp_path):
+    """The failure this is for: `Seal()` was constructed with a default
+    relative path inside a Fabric notebook, and a table of zeros was printed
+    and read as a measurement."""
+    with pytest.raises(harness.NotConfigured, match="does not exist"):
+        harness.results(store.load(), Seal(tmp_path / "nowhere"))
+
+
+def test_results_refuse_a_seal_directory_that_is_empty(tmp_path):
+    """Distinct from the above and just as dangerous — the stray directory the
+    old `Seal.__init__` left behind is still sitting there."""
+    empty = tmp_path / "sealed"
+    empty.mkdir()
+
+    with pytest.raises(harness.NotConfigured, match="is empty"):
+        harness.results(store.load(), Seal(empty))
+
+
+def test_the_table_refuses_an_unconfigured_seal_too(tmp_path):
+    """Both reporting surfaces, or the guard is decoration."""
+    with pytest.raises(harness.NotConfigured):
+        harness.table(store.load(), Seal(tmp_path / "nowhere"))
+
+
+def test_constructing_a_seal_creates_nothing(tmp_path):
+    """The root cause. A Seal that creates its own directory turns a wrong
+    path into a plausible-looking empty benchmark."""
+    path = tmp_path / "sealed"
+
+    Seal(path)
+
+    assert not path.exists()
+
+
+def test_storing_a_fault_creates_the_directory(tmp_path):
+    """Creation moved to `store`, which is the only method with something to
+    put there — so a real injection still works on a clean machine."""
+    seal = Seal(tmp_path / "nested" / "sealed")
+
+    seal.store(a_truth())
+
+    assert seal.exists()
+
+
+def test_results_name_the_backend_and_seal_that_produced_them(seal):
+    """An empty store and a store nobody pointed at the Lakehouse give
+    identical figures. These two keys are the only way a reader tells them
+    apart."""
+    seal.store(a_truth())
+
+    summary = harness.results(store.load(), seal)
+
+    assert summary["backend"] == "LocalParquet"
+    assert summary["seal_path"] == str(seal.path)
 
 
 # --- Verdicts --------------------------------------------------------------
