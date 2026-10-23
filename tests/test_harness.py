@@ -194,20 +194,56 @@ def test_results_count_verdicts_once_a_human_has_judged(seal):
     summary = harness.results(store.load(), seal)
 
     assert summary["verdict_correct"] == 1
-    assert summary["judged"] == 1
-    assert summary["unjudged"] == 0
+    assert summary["judged_against_seal"] == 1
 
 
-def test_unjudged_incidents_are_counted_as_unjudged(seal):
-    """Not as zero correct. The difference between "scored badly" and "not
-    scored" is the whole credibility of the table."""
+def test_an_undiagnosed_incident_is_not_a_diagnosis_awaiting_a_verdict(seal):
+    """Not as zero correct, and not as a backlog either. The difference
+    between "scored badly", "not scored" and "never looked at" is the whole
+    credibility of the table (D-047)."""
     seal.store(a_truth())
     store.record([an_incident("r1", INJECTED + timedelta(hours=1))])
 
     summary = harness.results(store.load(), seal)
 
-    assert summary["unjudged"] == 1
+    assert summary["undiagnosed"] == 1
+    assert summary["diagnosed_awaiting_verdict"] == 0
     assert "verdict_correct" not in summary
+
+
+# --- Keeping the two kinds of verdict apart (D-047) ------------------------
+
+
+def test_a_verdict_on_an_unmatched_incident_is_reported_separately(seal):
+    """Five correct answers out of five must not read as five out of eleven
+    because six other diagnoses were scored with no ground truth to compare
+    them against."""
+    seal.store(a_truth())
+    inside = an_incident("inside", INJECTED + timedelta(hours=1))
+    outside = an_incident("outside", INJECTED - timedelta(days=2))
+    store.record([inside, outside])
+
+    store.judge(inside.incident_id, "correct", "michael")
+    store.judge(outside.incident_id, "restatement", "michael")
+
+    summary = harness.results(store.load(), seal)
+
+    assert summary["verdict_correct"] == 1
+    assert summary["unsealed_verdict_restatement"] == 1
+    assert "verdict_restatement" not in summary
+    assert summary["judged_against_seal"] == 1
+    assert summary["judged_without_seal"] == 1
+
+
+def test_a_diagnosis_with_no_verdict_is_counted_as_awaiting_one(seal):
+    seal.store(a_truth())
+    incident = an_incident("r1", INJECTED + timedelta(hours=1))
+    store.record([incident], {incident.incident_id: _a_diagnosis(incident.incident_id)})
+
+    summary = harness.results(store.load(), seal)
+
+    assert summary["diagnosed_awaiting_verdict"] == 1
+    assert summary["undiagnosed"] == 0
 
 
 def test_a_live_fault_is_reported_as_live(seal):

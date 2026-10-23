@@ -192,20 +192,76 @@ def results(
         summary["latency_hours_median"] = ordered[len(ordered) // 2]
         summary["latency_hours_worst"] = ordered[-1]
 
+    # Split by whether the incident belongs to a sealed fault, because the
+    # two kinds of verdict answer different questions and must never share a
+    # denominator (D-047). A verdict on a matched incident is "did the agent
+    # name the mechanism we injected". A verdict on an unmatched one is only
+    # ever "did this diagnosis name a mechanism at all" — there is nothing to
+    # compare it against. Pooling them makes five correct answers out of five
+    # read as five out of eleven.
+    claimed = {i for ids in matched.values() for i in ids}
+    sealed, unsealed = _split_by_seal(frame, claimed)
+
     summary.update(_counts(frame, "diagnosis_source", "diagnosis"))
-    summary.update(_counts(frame, "verdict", "verdict"))
+    summary.update(_counts(sealed, "verdict", "verdict"))
+    summary.update(_counts(unsealed, "verdict", "unsealed_verdict"))
     summary.update(_counts(frame, "decision", "decision"))
     summary.update(_counts(frame, "proposal_target", "proposal"))
 
-    judged = (
-        frame["verdict"].notna().sum()
-        if not frame.empty and "verdict" in frame.columns
-        else 0
-    )
-    summary["judged"] = int(judged)
-    summary["unjudged"] = len(frame) - int(judged)
+    summary["judged_against_seal"] = _count_set(sealed, "verdict")
+    summary["judged_without_seal"] = _count_set(unsealed, "verdict")
+
+    # "Not judged" used to cover both a diagnosis waiting for a score and an
+    # incident nobody has diagnosed at all. Only the first is work the
+    # reviewer can do, and reporting 66 of the second as a backlog of the
+    # first overstates how far through the queue anyone is.
+    summary["diagnosed_awaiting_verdict"] = _count_awaiting(frame)
+    summary["undiagnosed"] = len(frame) - _count_set(frame, "diagnosis_cause")
 
     return summary
+
+
+def _split_by_seal(
+    frame: pd.DataFrame, claimed: set[str]
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """The frame divided into incidents inside a fault window, and the rest."""
+    if frame.empty:
+        return frame, frame
+
+    inside = frame["incident_id"].isin(claimed)
+
+    return frame[inside], frame[~inside]
+
+
+def _count_set(frame: pd.DataFrame, column: str) -> int:
+    """How many rows have a value in `column`. Zero if the column is absent."""
+    if frame.empty or column not in frame.columns:
+        return 0
+
+    return int(frame[column].notna().sum())
+
+
+def _count_awaiting(frame: pd.DataFrame) -> int:
+    """Diagnoses that exist and have not been scored.
+
+    Counted directly rather than subtracted, so a verdict recorded against an
+    incident carrying no diagnosis cannot drive the figure negative.
+    """
+    if frame.empty or "diagnosis_cause" not in frame.columns:
+        return 0
+
+    has_diagnosis = frame["diagnosis_cause"].notna()
+
+    # An all-False Series rather than the scalar False: `~False` is the
+    # integer -1, and combining that with a boolean Series does something
+    # quietly wrong instead of raising.
+    has_verdict = (
+        frame["verdict"].notna()
+        if "verdict" in frame.columns
+        else pd.Series(False, index=frame.index)
+    )
+
+    return int((has_diagnosis & ~has_verdict).sum())
 
 
 def _require_seal(seal: Seal) -> None:
