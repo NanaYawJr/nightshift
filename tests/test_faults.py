@@ -14,7 +14,7 @@ is its behaviour in Fabric.
 """
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -715,10 +715,109 @@ def test_a_fault_ends_once(landing, tmp_path):
         "ws", "pl", landing_path=str(landing), backup_dir=str(tmp_path / "backup")
     )
     truth = fault.inject_and_seal(FakeSpark(), seal)
-    seal.mark_reverted(truth.fault_id)
+    ended = datetime(2026, 10, 15, 20, 3, tzinfo=timezone.utc)
+    seal.mark_reverted(truth.fault_id, ended)
 
     with pytest.raises(ValueError, match="already recorded as reverted"):
+        seal.mark_reverted(truth.fault_id, ended)
+
+
+# --- Correcting a wrong end time (D-046) -----------------------------------
+
+
+def test_mark_reverted_will_not_guess_the_time(landing, tmp_path):
+    """The defect behind the first benchmark run's wrong window: `at` used to
+    default to the clock, so recording a revert four days late recorded the
+    wrong day. The clock knows when the method was called, not when the fault
+    ended."""
+    seal = Seal(tmp_path / "sealed")
+    fault = SilentZeroRow(
+        "ws", "pl", landing_path=str(landing), backup_dir=str(tmp_path / "backup")
+    )
+    truth = fault.inject_and_seal(FakeSpark(), seal)
+
+    with pytest.raises(TypeError):
         seal.mark_reverted(truth.fault_id)
+
+
+def test_a_wrong_end_time_can_be_corrected_with_a_reason(landing, tmp_path):
+    seal = Seal(tmp_path / "sealed")
+    fault = SilentZeroRow(
+        "ws", "pl", landing_path=str(landing), backup_dir=str(tmp_path / "backup")
+    )
+    truth = fault.inject_and_seal(FakeSpark(), seal)
+    wrong = datetime(2026, 10, 20, 10, 21, tzinfo=timezone.utc)
+    right = datetime(2026, 10, 15, 20, 3, tzinfo=timezone.utc)
+
+    seal.mark_reverted(truth.fault_id, wrong)
+    seal.correct_reverted(truth.fault_id, right, reason="sampler saw 5,000 rows")
+
+    assert seal.load(truth.fault_id).reverted_at == right
+
+
+def test_a_correction_keeps_the_value_it_replaced(landing, tmp_path):
+    """The whole point. A seal that can be silently edited is not a seal; one
+    that records what it used to say is still evidence."""
+    seal = Seal(tmp_path / "sealed")
+    fault = SilentZeroRow(
+        "ws", "pl", landing_path=str(landing), backup_dir=str(tmp_path / "backup")
+    )
+    truth = fault.inject_and_seal(FakeSpark(), seal)
+    wrong = datetime(2026, 10, 20, 10, 21, tzinfo=timezone.utc)
+
+    seal.mark_reverted(truth.fault_id, wrong)
+    seal.correct_reverted(
+        truth.fault_id,
+        datetime(2026, 10, 15, 20, 3, tzinfo=timezone.utc),
+        reason="sampler saw 5,000 rows at 20:03",
+    )
+
+    record = seal.load(truth.fault_id).corrections[0]
+
+    assert record["from"] == wrong.isoformat()
+    assert "5,000 rows" in record["reason"]
+
+
+def test_a_correction_without_a_reason_is_refused(landing, tmp_path):
+    """A correction with no stated evidence is indistinguishable from fitting
+    ground truth to the result."""
+    seal = Seal(tmp_path / "sealed")
+    fault = SilentZeroRow(
+        "ws", "pl", landing_path=str(landing), backup_dir=str(tmp_path / "backup")
+    )
+    truth = fault.inject_and_seal(FakeSpark(), seal)
+    seal.mark_reverted(truth.fault_id, datetime(2026, 10, 20, tzinfo=timezone.utc))
+
+    with pytest.raises(ValueError, match="needs a reason"):
+        seal.correct_reverted(
+            truth.fault_id, datetime(2026, 10, 15, tzinfo=timezone.utc), reason="  "
+        )
+
+
+def test_an_uncorrected_record_carries_no_corrections(landing, tmp_path):
+    """So the presence of the list means something when it is not empty."""
+    seal = Seal(tmp_path / "sealed")
+    fault = SilentZeroRow(
+        "ws", "pl", landing_path=str(landing), backup_dir=str(tmp_path / "backup")
+    )
+    truth = fault.inject_and_seal(FakeSpark(), seal)
+
+    assert seal.load(truth.fault_id).corrections == []
+
+
+def test_a_live_fault_cannot_be_corrected(landing, tmp_path):
+    """Nothing to replace. Allowing it would let `correct_reverted` be used to
+    set an end time that was never recorded, bypassing mark_reverted."""
+    seal = Seal(tmp_path / "sealed")
+    fault = SilentZeroRow(
+        "ws", "pl", landing_path=str(landing), backup_dir=str(tmp_path / "backup")
+    )
+    truth = fault.inject_and_seal(FakeSpark(), seal)
+
+    with pytest.raises(ValueError, match="no recorded end time"):
+        seal.correct_reverted(
+            truth.fault_id, datetime(2026, 10, 15, tzinfo=timezone.utc), reason="x"
+        )
 
 
 def test_the_window_of_a_live_fault_has_no_end(landing, tmp_path):

@@ -61,6 +61,14 @@ class GroundTruth:
     parameters: dict[str, Any] = field(default_factory=dict)
     reverted_at: datetime | None = None
 
+    # Every correction ever made to this record, oldest first (D-046). A
+    # sealed record is not immutable in the sense of "never wrong" — it is
+    # immutable in the sense of "never quietly changed". Each entry keeps the
+    # superseded value, the evidence, and when the correction was made, so a
+    # reader can reconstruct what the record said at any point and judge the
+    # correction for themselves.
+    corrections: list[dict[str, Any]] = field(default_factory=list)
+
     def to_json(self) -> str:
         payload = asdict(self)
         for key in ("injected_at", "reverted_at"):
@@ -170,9 +178,13 @@ class Fault(ABC):
         still live, so the harness has no way to know which window to score
         against — it would judge a healthy estate against a fault that ended
         days ago (D-041).
+
+        This is the one caller entitled to use the clock, because the revert
+        it is recording happened on the line above. `mark_reverted` refuses to
+        read the clock itself for exactly that reason (D-046).
         """
         self.revert(spark)
-        return seal.mark_reverted(self.fault_id)
+        return seal.mark_reverted(self.fault_id, datetime.now(timezone.utc))
 
     @classmethod
     def from_ground_truth(cls, truth: GroundTruth) -> "Fault":
@@ -271,9 +283,7 @@ class Seal:
     def list_ids(self) -> list[str]:
         return sorted(p.stem for p in self.path.glob("*.json"))
 
-    def mark_reverted(
-        self, fault_id: str, at: datetime | None = None
-    ) -> GroundTruth:
+    def mark_reverted(self, fault_id: str, at: datetime) -> GroundTruth:
         """Record when a fault ended. The only field a sealed record may gain.
 
         `store` refuses to overwrite because the mechanism must never change
@@ -282,6 +292,13 @@ class Seal:
         indistinguishable from a live one — so the harness cannot tell which
         runs belong inside the fault window and which belong to the healthy
         period either side (D-041).
+
+        `at` is required and has no default (D-046). It used to default to the
+        clock, and the first real benchmark run recorded a fault as ending on
+        20 October when the estate's own telemetry showed it ended on the
+        15th — because the revert was done by hand on one day and recorded on
+        another. The clock knows when this method was called, which is not the
+        same fact and must not be allowed to impersonate it.
 
         Everything else in the record is rewritten byte-identically, so the
         mechanism a diagnosis is scored against is still the one that was
@@ -292,10 +309,60 @@ class Seal:
         if truth.reverted_at is not None:
             raise ValueError(
                 f"{fault_id} was already recorded as reverted at "
-                f"{truth.reverted_at.isoformat()}. A fault ends once."
+                f"{truth.reverted_at.isoformat()}. A fault ends once — use "
+                "correct_reverted() if the recorded time is wrong."
             )
 
-        truth.reverted_at = at or datetime.now(timezone.utc)
+        truth.reverted_at = at
+        (self.path / f"{fault_id}.json").write_text(truth.to_json())
+
+        return truth
+
+    def correct_reverted(
+        self, fault_id: str, at: datetime, reason: str
+    ) -> GroundTruth:
+        """Replace a wrong end time, keeping the old one and the evidence.
+
+        The seal exists to stop ground truth being fitted to results after the
+        fact. It does not exist to preserve a timestamp everyone can see is
+        wrong — a record known to be false is worse than one openly corrected,
+        and leaving it would mean publishing a window the estate's own
+        telemetry contradicts.
+
+        So the correction is allowed and made loud: the superseded value, the
+        reason, and when the correction happened are appended to
+        `corrections`, which `to_json` writes into the file. Nothing is
+        erased, and a reader can see every version the record has held.
+
+        `reason` is required and must cite what the new time is derived from.
+        A correction with no stated evidence is indistinguishable from fitting
+        the ground truth to the answer.
+        """
+        if not reason.strip():
+            raise ValueError(
+                "A correction needs a reason naming the evidence it rests on. "
+                "Without one this is indistinguishable from editing ground "
+                "truth to suit the result."
+            )
+
+        truth = self.load(fault_id)
+
+        if truth.reverted_at is None:
+            raise ValueError(
+                f"{fault_id} has no recorded end time to correct. Use "
+                "mark_reverted() to set one for the first time."
+            )
+
+        truth.corrections.append(
+            {
+                "field": "reverted_at",
+                "from": truth.reverted_at.isoformat(),
+                "to": at.isoformat(),
+                "reason": reason.strip(),
+                "corrected_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        truth.reverted_at = at
         (self.path / f"{fault_id}.json").write_text(truth.to_json())
 
         return truth
