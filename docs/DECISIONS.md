@@ -2060,3 +2060,416 @@ built before the harness.
 backup protects the ability to undo it. Both are needed, only one existed, and
 an audit trail that outlives the thing it is auditing is a particular kind of
 useless.
+
+## D-038 — Facts about the measurement live in their own namespace
+
+**Date:** 2026-10-19
+**Status:** Accepted, implemented
+
+**Context.** Six incidents were diagnosed from the same evidence pack. Three
+produced a confident cause — *the source file was empty* — and three correctly
+declined to name one. The split came from a single fact key.
+
+The pack contained `source.snapshots_observed: 0`. It meant "the landing
+sampler took no samples near this run". Three diagnoses read it as "the source
+had nothing in it", which is a statement about the estate rather than about
+the monitoring, and reached a cause that happened to be right for the wrong
+reason. The other three read it correctly and abstained.
+
+The key was not ambiguous by accident. It described a property of the
+measurement while sitting in the namespace of the thing being measured.
+Everything else beginning `source.` was a fact about the file; this one was a
+fact about Nightshift.
+
+**Decision.** Facts about coverage move to a `coverage.` prefix.
+`source.snapshots_observed` becomes `coverage.source_samples`, and
+`coverage.source_measured` states plainly whether the source was observed at
+all. The system prompt says that facts beginning `coverage.` describe what was
+measured, not the estate.
+
+A test asserts that no key under `source.` ends with `_observed` or
+`_samples`, so the distinction cannot quietly erode.
+
+**Consequences.** The namespace is now load-bearing documentation rather than
+tidiness. Every new fact has to be classified as a property of the estate or a
+property of the observation, and getting it wrong is a correctness bug rather
+than a naming preference.
+
+**Also implied.** The first version of that test was written too broadly and
+flagged `table.commits_observed` and `source.sampled_at`, neither of which is
+a coverage claim about the source. A test that fails on correct code gets
+disabled, so it was narrowed to the one rule that matters.
+
+---
+
+## D-039 — Abstention, degradation and a model answer are three outcomes, not two
+
+**Date:** 2026-10-19
+**Status:** Accepted, implemented
+
+**Context.** The store summary reported `by_fallback: 3`, and that number was
+counting two unrelated things.
+
+A diagnosis reached the fallback path when the model was unreachable, replied
+unparseably, or cited a fact that did not exist — a degraded system producing
+template text. It also reached it when the model read the evidence, judged it
+insufficient, and declined to name a cause. The second is the system working
+exactly as intended. Both were recorded identically.
+
+A benchmark that cannot separate them cannot report the one finding that
+matters most about an agent: whether it knows when it does not know.
+
+**Decision.** `Diagnosis.source` is a three-valued literal — `model`,
+`abstention`, `fallback`. `Diagnosis.unknown()` sets `abstention`.
+`fallback_reason` is populated only for genuine degradation and says what went
+wrong.
+
+**Consequences.** The published table reports abstention as a result and
+fallback as an outage, and the two can never be averaged together. Immediately
+useful: the next run's `{'model': 1, 'abstention': 5}` was legible as good
+behaviour rather than as five failures.
+
+**Also implied.** The same distinction was then needed on the remediation side
+and `Proposal.source` carries it for the same reason — a proposal declining to
+suggest a change is not a proposal that could not be produced.
+
+---
+
+## D-040 — Notebook cells clear their own stale modules before use
+
+**Date:** 2026-10-19
+**Status:** Accepted, implemented. Extended by D-048
+
+**Context.** A fix was pushed, Cell 1 re-downloaded the repository, the
+notebook was re-run, and the output was identical. The natural conclusion was
+that the fix did not work, and twenty minutes went into re-examining code that
+was already correct.
+
+Python had imported the module during the earlier run and kept it in
+`sys.modules`. Re-downloading the source changes the files on disk and nothing
+in the live session. The second import was a no-op.
+
+**Decision.** After the download, Cell 1 deletes every `sys.modules` entry
+belonging to a package in this repository, and prints a marker proving the new
+code is the code that loaded.
+
+**Consequences.** Cell 1 is no longer just a download step and cannot be
+skipped when only "the code changed". The marker print exists because this
+failure is silent by nature — the notebook runs cleanly and reports the old
+answer.
+
+---
+
+## D-041 — A sealed record gains an end time, once
+
+**Date:** 2026-10-20
+**Status:** Accepted, implemented. Amended by D-046
+
+**Context.** `GroundTruth` had a `reverted_at` field, `Seal.store` refused to
+overwrite, and no method existed to write it. A reverted fault was therefore
+indistinguishable in the seal from one still running.
+
+That breaks attribution. The harness scores an incident by asking whether its
+run started while a fault was live, and a fault with no end is live forever —
+so a healthy estate weeks later would be judged against a fault that ended
+days ago, and every incident in between would be credited to it.
+
+**Decision.** `Seal.mark_reverted` writes the end time and refuses to write it
+twice. `Fault.revert_and_record` reverts and closes the record in one call, so
+the two cannot drift apart. `Seal.active()` lists faults with no end time, and
+`Seal.window()` returns the pair.
+
+The end time is the only field a sealed record may gain. Everything else is
+rewritten byte-identically, so the mechanism a diagnosis is scored against is
+still the one sealed at injection.
+
+**Consequences.** `window()` returns `None` rather than "now" for a live
+fault. A caller scoring an open window has to decide what to do about it
+instead of being handed a timestamp that looks measured.
+
+**Also implied.** Nothing stopped the recording happening long after the
+revert, which is how the first benchmark run acquired a four-day error. See
+D-046.
+
+---
+
+## D-042 — The agent proposes, a human decides, nothing is applied
+
+**Date:** 2026-10-20
+**Status:** Accepted, implemented
+
+**Context.** With 28 days of trial left, the remaining scope was one of three
+things: a second fault class, automated application of fixes, or one class
+taken end to end with a scored result. Raising pull requests against item
+definitions was the most impressive-sounding and the least defensible — an
+agent that writes to a production estate without review is a different project
+with a different risk profile, and a trial estate is the worst place to
+demonstrate it.
+
+**Context also.** A proposed fix is the only part of this system a reader can
+disagree with usefully. A diagnosis is right or wrong against a sealed record;
+a fix is a judgement, and the figure that matters is whether a human would
+merge it.
+
+**Decision.** `agent/agents/remediator.py` produces text. A human records
+`approved` or `rejected` against the incident. No code path in this project
+writes to the estate it monitors.
+
+`target="none"` is a first-class answer: "no change is warranted" is a
+correct output, not a failure to produce one.
+
+There is deliberately **no template fallback for remediation**, unlike
+diagnosis. A deterministic diagnosis can still state measured facts usefully.
+A deterministic remediation would be a canned change applied to a situation
+nobody reasoned about, and a reviewer approving one of those is worse than a
+reviewer seeing nothing.
+
+**Decision also.** A proposal for an undiagnosed incident is refused before
+the model is called. A fix for an unexplained symptom is a guess wearing a
+diff.
+
+**Consequences.** "Self-healing" in this project means the loop closes with a
+human in it, and the documentation says so rather than implying otherwise. The
+fix-acceptance figure measures one engineer's judgement, which is a stated
+limitation and not a fixable one here.
+
+---
+
+## D-043 — A decision or verdict for an unknown incident id is refused
+
+**Date:** 2026-10-20
+**Status:** Accepted, implemented
+
+**Context.** The review notebook's decide cell carries a placeholder,
+`INCIDENT = "INC-xxxxxxxxxx"`, to be replaced with a real id. It was run with
+the placeholder still in it.
+
+`store.decide` wrote the row. The store is append-only by design (D-028), so
+there was now a permanent decision against an incident that had never
+existed, and no way to edit it out — it took a `DELETE` against the Delta
+table, the one operation this store exists to avoid.
+
+**Decision.** `decide`, `judge` and `link_to_fault` raise `KeyError` when the
+incident id is not in the store.
+
+**Consequences.** A typo fails before it writes anything. The cost is one read
+of the store per call, which is irrelevant next to a corrupt benchmark record.
+
+**Also implied.** An append-only store makes a bad write permanent, so
+validation has to happen before the write rather than being fixed afterwards.
+That is the trade D-028 accepted, and this is the first time the bill arrived.
+
+---
+
+## D-044 — Restatement is a verdict of its own
+
+**Date:** 2026-10-20
+**Status:** Accepted, implemented
+
+**Context.** The rubric had three root-cause verdicts: correct, partial,
+incorrect. Then a diagnosis arrived reading *"the pipeline run completed
+successfully but delivered zero rows to the target table, violating the
+minimum row expectation"* — for an incident which **is** a pipeline run
+completing successfully and delivering zero rows.
+
+It is not a wrong mechanism, so "incorrect" overstates it. It is not a partly
+right mechanism, so "partial" is wrong. It names no mechanism at all, and
+carries nothing the deterministic detection rule had not already produced.
+
+It is also the failure that looks most like success. Valid JSON, valid
+citations, high stated confidence, a sensible recommended action. Nothing in
+the output marks it as empty.
+
+**Decision.** `VERDICTS` becomes `("correct", "partial", "restatement",
+"incorrect", "abstained")`. A verdict is assigned by a human comparing the
+diagnosis to the sealed record; no string comparison is used, because *"the
+source file contained no data rows"* and *"the landing file was written with
+its header row and no data rows"* are the same answer in different words and
+keyword matching would score this project's vocabulary rather than its
+correctness.
+
+`abstained` is recorded as a result, not a miss. A system that declines when
+the evidence is insufficient is behaving correctly, and scoring that as failure
+rewards confident guessing — which is exactly what `restatement` exists to
+catch.
+
+**Consequences.** The headline accuracy figure is lower than it would be under
+the three-verdict rubric, because three diagnoses that would have been
+scattered across "partial" and "incorrect" now sit under a name that says
+plainly they contained nothing.
+
+**Also implied.** This verdict made the project's central finding visible:
+with source evidence in the pack, five diagnoses named the mechanism and none
+restated it; without it, three restated and three abstained. Under the old
+rubric that contrast would have been reported as a mix of partials and
+incorrects, and the pattern would not have been readable at all.
+
+---
+
+## D-045 — The harness refuses to score against a seal that holds nothing
+
+**Date:** 2026-10-23
+**Status:** Accepted, implemented
+
+**Context.** `harness.table()` and `harness.results()` were run for the first
+time and returned an empty table and a summary of zeros, including
+`incidents_total: 0`, while the store held 77 incidents.
+
+The cause was worse than a missing setting. `Seal.__init__` called
+`mkdir(parents=True, exist_ok=True)`, so constructing `Seal()` with its default
+relative path **created** an empty ground-truth directory beside the notebook,
+and the harness then scored against it. The measuring instrument manufactured
+the thing it was measuring and reported the result as zero.
+
+This is the third instance of the same failure in this project. The first
+turned 134 unmeasured row counts into real-looking zeros (D-035). The second
+read the sampler's own coverage as a statement that the source was empty
+(D-038). This one printed a benchmark table from a directory the code had just
+invented.
+
+**Decision.** `Seal` no longer creates its directory on construction;
+creation moves to `store`, which is the only method with something to put
+there. `Seal.exists()` reports whether any ground truth is present.
+`results()` and `table()` raise `NotConfigured` when the seal holds no faults,
+with a message naming the path and whether it is missing or empty.
+
+Both also report the active storage backend and the seal path alongside the
+figures, because an unconfigured run and a run that found nothing otherwise
+produce identical output.
+
+**Decision also.** An empty *incident store* does not raise. That is a
+measured result — the fault was injected and nothing was detected — and a miss
+is the most important thing the harness has to say.
+
+**Consequences.** A wrong seal path now stops the run instead of producing a
+publishable-looking table. The provenance lines make the next instance of this
+visible in the output rather than in a reader's assumption.
+
+**Also implied.** Found while reproducing this: `storage.use_local("data")`
+with a string root crashed four frames away from the call, because
+`LocalParquet` never coerced its root to a `Path`. Fixed in the same change.
+
+---
+
+## D-046 — A sealed end time may be corrected from evidence, on the record
+
+**Date:** 2026-10-23
+**Status:** Accepted, implemented. Amends D-041
+
+**Context.** The first complete benchmark table reported the injected fault as
+live from 15 October 15:03 to 20 October 10:21 — four days and nineteen hours.
+It was live for five hours.
+
+`mark_reverted` had `at` defaulting to the current clock. The revert was
+performed by hand on one day and recorded on another, so the seal stored the
+clock reading at the moment of bookkeeping. The estate's own telemetry
+contradicted it: the hourly source sampler measured zero data rows through
+15 October 19:05 and 5,000 rows at 20:03.
+
+The score survived by luck. Five incidents inside a five-day window on an
+hourly pipeline proves the fault was live for five runs, not five days, and
+the extra four days were empty because the estate was healthy. But the
+published window would have claimed something untrue, and "we left a fault
+running for five days" is a materially different statement from "for five
+hours".
+
+**Decision, on the cause.** `mark_reverted` requires `at`. The only caller
+entitled to use the clock is `revert_and_record`, which has performed the
+revert on the line above and therefore knows. The clock knows when a method
+was called, which is not the same fact and must not be allowed to impersonate
+it.
+
+**Decision, on the record.** `Seal.correct_reverted(fault_id, at, reason)`
+replaces a wrong end time and appends the superseded value, the reason and the
+correction time to a `corrections` list that `to_json` writes into the file.
+Nothing is erased. A correction with an empty reason is refused.
+
+A seal exists to stop ground truth being fitted to results after the fact. It
+does not exist to preserve a value that the estate's own measurements
+contradict — a record known to be false is worse than one openly corrected.
+What makes the correction legitimate is that the evidence is independent of
+the result, is stored with it, and can be checked: no pipeline run falls
+between the last silent sample and the first healthy one, so attribution,
+latency and every verdict are identical before and after.
+
+**Consequences.** The seal is immutable in the sense of *never quietly
+changed*, not *never wrong*, and the file now carries its own revision
+history. A reader can reconstruct what the record said at any point and judge
+the correction themselves.
+
+**Consequences also.** A correction that *did* change a score would be visible
+as such, and would need a far stronger justification than this one. That case
+has not arisen and no rule covers it yet.
+
+---
+
+## D-047 — Sealed and unsealed verdicts are never pooled
+
+**Date:** 2026-10-23
+**Status:** Accepted, implemented
+
+**Context.** The benchmark summary reported `verdict_correct: 5`,
+`verdict_restatement: 3`, `verdict_abstained: 3`, `judged: 11`. A reader
+computes five correct out of eleven and gets 45%.
+
+Those are two different experiments. Five incidents were scored against sealed
+ground truth. Six were scored without any — they predate the source sampler,
+so no seal exists for them, and the only thing checkable about them is whether
+the diagnosis named a mechanism at all. Sharing a denominator made a result of
+five out of five read as mediocre, and made six judgements with nothing to
+compare against look like part of a measurement.
+
+`unjudged: 66` had the same shape of problem. All 66 are incidents nobody has
+diagnosed, not diagnoses waiting for a score, and reporting them as the latter
+overstates how far through the queue anyone is.
+
+**Decision.** Verdicts on incidents inside a fault window keep the
+`verdict_*` keys. Verdicts on incidents outside every window are reported
+under `unsealed_verdict_*`. `judged` becomes `judged_against_seal` and
+`judged_without_seal`. `unjudged` becomes `diagnosed_awaiting_verdict` and
+`undiagnosed`, counted directly rather than by subtraction so a verdict on an
+undiagnosed incident cannot drive the figure negative.
+
+**Consequences.** No single accuracy ratio is computable across both groups.
+That is deliberate: there is no honest one.
+
+**Also implied.** Incidents outside every fault window are reported as
+unmatched, never as false positives. This estate's 72 unmatched incidents are
+real zero-row deliveries the rule correctly flagged, and calling them false
+positives would score the rule as wrong for being right.
+
+---
+
+## D-048 — The stale-module list is derived from the repository, not written by hand
+
+**Date:** 2026-10-23
+**Status:** Accepted, implemented. Extends D-040
+
+**Context.** D-040's purge used a hand-written set of package names:
+`{"agent", "collectors", "common", "detection", "estate", "store"}`.
+
+`eval` is not in it. When D-040 was written the harness was not imported in
+any notebook, so the omission was invisible and harmless. The afternoon the
+scoring work began, `eval.harness` became the one package being actively
+changed — and the one package the purge never cleared. Cell 1 re-downloaded
+new code three times and the notebook kept printing results from the version
+replaced hours earlier, including after a confirmed push to `main`.
+
+The diagnosis cost two wasted round trips, both of which were "re-run Cell 1",
+which was the one thing guaranteed not to help.
+
+**Decision.** The list is derived from what was just downloaded: every
+top-level directory containing an `__init__.py`. The cell prints the derived
+list and the number of modules cleared, so a future failure of this kind
+appears in the output rather than in a wrong answer.
+
+**Consequences.** A fix that depends on a hand-maintained list has an expiry
+date, and this one expired the moment the project grew a package. The derived
+version cannot be wrong about a package that exists.
+
+**Also implied.** The general case is worth stating, since this is the second
+time it has bitten: a guard that enumerates what it protects will eventually
+protect less than it claims. Where the thing being enumerated can be
+discovered, discover it.
+
+---
